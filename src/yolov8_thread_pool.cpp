@@ -61,6 +61,7 @@ void Yolov8ThreadPool::worker(int id) {
                 img_results.insert({task.id, std::move(task.image)});
                 capture_timestamps_ms_[task.id] = task.capture_timestamp_ms;
             }
+            cv_result.notify_all();  // 结果就绪，唤醒阻塞等待的消费线程
         }
     }
 }
@@ -205,6 +206,62 @@ nn_error_e Yolov8ThreadPool::tryGetLatestResultRaw(cv::Mat& img, int& out_id, in
                                                     std::vector<Detection>& detections,
                                                     int64_t* capture_timestamp_ms) {
     std::lock_guard<std::mutex> lock(mtx2);
+    int best_id = -1;
+    for (const auto& [fid, _] : img_results) {
+        if (fid > last_delivered_id_ && fid > best_id &&
+            results.find(fid) != results.end())
+            best_id = fid;
+    }
+    if (best_id < 0) {
+        for (auto it = img_results.begin(); it != img_results.end();) {
+            if (it->first <= last_delivered_id_) {
+                results.erase(it->first);
+                capture_timestamps_ms_.erase(it->first);
+                it = img_results.erase(it);
+                dropped_result_frames++;
+            } else {
+                ++it;
+            }
+        }
+        return NN_TIMEOUT;
+    }
+
+    out_id = best_id;
+    img = img_results[best_id];
+    detections = results[best_id];
+    if (capture_timestamp_ms) *capture_timestamp_ms = capture_timestamps_ms_[best_id];
+    box_count = (int)detections.size();
+    last_delivered_id_ = best_id;
+
+    for (auto it = img_results.begin(); it != img_results.end(); ) {
+        if (it->first != best_id) {
+            results.erase(it->first);
+            capture_timestamps_ms_.erase(it->first);
+            it = img_results.erase(it);
+            dropped_result_frames++;
+        } else {
+            ++it;
+        }
+    }
+    results.erase(best_id);
+    capture_timestamps_ms_.erase(best_id);
+    img_results.erase(best_id);
+    return NN_SUCCESS;
+}
+
+nn_error_e Yolov8ThreadPool::waitLatestResultRaw(cv::Mat& img, int& out_id, int& box_count,
+                                                  std::vector<Detection>& detections,
+                                                  int64_t* capture_timestamp_ms, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mtx2);
+    // 阻塞等待：直到出现可交付的最新结果，或超时。用条件变量避免 sleep 忙等待。
+    cv_result.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
+        for (const auto& [fid, _] : img_results) {
+            if (fid > last_delivered_id_ && results.find(fid) != results.end())
+                return true;
+        }
+        return false;
+    });
+
     int best_id = -1;
     for (const auto& [fid, _] : img_results) {
         if (fid > last_delivered_id_ && fid > best_id &&

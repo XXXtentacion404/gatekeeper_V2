@@ -193,27 +193,30 @@ def _rect_to_line_depth(zone):
 
 
 # ==================== 多边形绘制 ====================
+# 入/出标记区域深度（px）：标记线向检测区内延伸 100px 为入标记区域，
+# 向检测区外延伸 50px 为出标记区域。
+ENTRY_MARKER_DEPTH = 100
+EXIT_MARKER_DEPTH = 50
+
+
 class PolygonDrawer(QWidget):
     MODE_POLYGON = 0
-    MODE_ENTRY_ZONE = 1   # 入口矩形: 2 点绊线 + 拖 1 点拉宽度
-    MODE_EXIT_ZONE = 2    # 出口矩形: 同上
+    MODE_MARKER_LINE = 1   # 标记线: 选检测区域边界 2 点 -> 自动算入/出标记区域
 
     def __init__(self):
         super().__init__()
-        self.current = []         # 绘制中: [p1_disp, p2_disp, drag_disp]
+        self.current = []         # 绘制中: [p1_disp, p2_disp]
         self.polygons = []
-        # 4 点矩形: [(p1),(p2),(p3),(p4)]  p1->p2 外侧边(绊线), p3->p4 内侧边
-        self.entry_zone = None
-        self.exit_zone = None
+        # 4 点矩形: [(p1),(p2),(p3),(p4)]  p1->p2 标记线(外侧边), p3->p4 内侧边
+        self.entry_zone = None    # 入标记区域（标记线向检测区内 ENTRY_MARKER_DEPTH）
+        self.exit_zone = None     # 出标记区域（标记线向检测区外 EXIT_MARKER_DEPTH）
+        self.marker_line = None   # 标记线 [p1, p2]（图像坐标）
         self.mode = self.MODE_POLYGON
         self.drawing = False
         self.frame = None
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ow = self.oh = 0
         self.scale = 1.0; self.ox = self.oy = 0; self.dw = self.dh = 0
-        # 拖动支持 (拖已完成矩形的 4 个角点改宽度或位置)
-        self.drag_idx = -1
-        self.drag_target = None  # 'entry' / 'exit' / None
 
     def set_mode(self, mode): self.mode = mode; self.drawing = False; self.current = []
 
@@ -234,100 +237,66 @@ class PolygonDrawer(QWidget):
         return max(0,min(int((p.x()-self.ox)/self.scale), self.ow)), max(0,min(int((p.y()-self.oy)/self.scale), self.oh))
     def _clamp(self, p):
         return QPoint(max(self.ox,min(p.x(),self.ox+self.dw)), max(self.oy,min(p.y(),self.oy+self.dh)))
-    def _dist2(self, a, b):
-        dx, dy = a.x()-b.x(), a.y()-b.y()
-        return dx*dx + dy*dy
-    def _hit_corner(self, p):
-        """命中已完成矩形的角 (p1 或 p2: 绊线端点) 允许拖动改位置; p3 (宽度控制点)"""
-        r2 = 100  # 10px²
-        for zone, name in [(self.entry_zone, 'entry'), (self.exit_zone, 'exit')]:
-            if not zone: continue
-            for i, (x, y) in enumerate(zone):
-                td = self._td(x, y)
-                if self._dist2(p, td) <= r2:
-                    return (name, i)
-        return None
+
+    # ---- 标记线 -> 入/出标记区域 ----
+    def _compute_marker_zones(self, p1, p2):
+        """由标记线 [p1,p2] 和检测区域多边形，自动计算入/出标记区域。
+        入标记区域 = 标记线向检测区内延伸 ENTRY_MARKER_DEPTH px
+        出标记区域 = 标记线向检测区外延伸 EXIT_MARKER_DEPTH px
+        入侧方向 = 指向检测区域多边形中心的方向。"""
+        dx = p2[1] - p1[1]
+        dy = -(p2[0] - p1[0])
+        L = (dx*dx + dy*dy) ** 0.5
+        if L < 1:
+            return None, None
+        ux, uy = dx/L, dy/L   # 右手系法向 (与 C++ inwardNormal 约定一致)
+        # 检测区域中心（所有多边形点的平均）
+        cx = cy = None
+        pts = [pt for poly in self.polygons for pt in poly]
+        if pts:
+            cx = sum(x for x, y in pts) / len(pts)
+            cy = sum(y for x, y in pts) / len(pts)
+        if cx is not None:
+            dot = (cx - p1[0]) * ux + (cy - p1[1]) * uy
+            if dot < 0:
+                ux, uy = -ux, -uy   # 翻转，指向检测区内
+        entry = [p1, p2,
+                 (int(round(p1[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p1[1] + uy*ENTRY_MARKER_DEPTH))),
+                 (int(round(p2[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p2[1] + uy*ENTRY_MARKER_DEPTH)))]
+        exit_ = [p1, p2,
+                 (int(round(p1[0] - ux*EXIT_MARKER_DEPTH)), int(round(p1[1] - uy*EXIT_MARKER_DEPTH))),
+                 (int(round(p2[0] - ux*EXIT_MARKER_DEPTH)), int(round(p2[1] - uy*EXIT_MARKER_DEPTH)))]
+        return entry, exit_
 
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton: return
         p = self._clamp(e.pos())
-        # 拖动检测: 命中已有矩形的角
-        if self.mode in (self.MODE_ENTRY_ZONE, self.MODE_EXIT_ZONE):
-            hit = self._hit_corner(p)
-            if hit:
-                self.drag_target, self.drag_idx = hit[0], hit[1]
-                self.drawing = False
-                return
-        # 入口/出口矩形: 2 点绊线 + 拖宽度
-        if self.mode == self.MODE_ENTRY_ZONE or self.mode == self.MODE_EXIT_ZONE:
+        if self.mode == self.MODE_MARKER_LINE:
+            # 标记线: 两次点击分别确定 p1 / p2
             if len(self.current) == 0:
-                # 第一次点击 = 绊线起点 p1
                 self.current = [p]
                 self.drawing = True
             elif len(self.current) == 1:
-                # 第二次点击 = 绊线终点 p2
                 self.current.append(p)
-                # 等待 mouseMove + mouseRelease 拉宽度
-            # elif len(self.current) >= 2: 已是拖动模式, 不再响应 press
+                self.drawing = False
+                self._finish_marker_line()
         else:
             self.drawing = True; self.current = [p]
         self.update()
 
     def mouseMoveEvent(self, e):
-        if self.drag_idx >= 0:
-            p = self._clamp(e.pos())
-            ox, oy = self._to(p)
-            tgt = self.entry_zone if self.drag_target == 'entry' else self.exit_zone
-            if tgt:
-                # 拖动角点: idx 0/1 是绊线端点 p1/p2; idx 2/3 是内侧边端点 (改其中一个即可让矩形自适应)
-                if self.drag_idx in (0, 1):
-                    tgt[self.drag_idx] = (ox, oy)
-                    # 重算对应的内侧点 (保持矩形是直角的)
-                    if self.drag_idx == 0:
-                        # p1 改了, 同步移动 p3 (p3 = p2 + (p1_new - p2_new) + offset)
-                        # 简化: 用之前记录的相对偏移
-                        pass
-                    else:
-                        pass
-                else:
-                    # 拖动 p3 或 p4: 重新算 (让外侧边不变, 改深度和方向)
-                    if self.drag_idx == 2:
-                        # 拖 p3 (内侧边起点), 同步算 p4 保证矩形
-                        tgt[2] = (ox, oy)
-                        tgt[3] = (tgt[1][0] + ox - tgt[0][0], tgt[1][1] + oy - tgt[0][1])
-                    else:
-                        # 拖 p4
-                        tgt[3] = (ox, oy)
-                        tgt[2] = (tgt[0][0] + ox - tgt[1][0], tgt[0][1] + oy - tgt[1][1])
-            self.update()
+        if self.mode != self.MODE_POLYGON:
             return
         if not self.drawing: return
         p = self._clamp(e.pos())
-        # 画矩形过程中 (绊线已画完, 拖动拉宽度)
-        if self.mode in (self.MODE_ENTRY_ZONE, self.MODE_EXIT_ZONE):
-            if len(self.current) == 2:
-                # 第一次拖动: 增加拖动点 current[2]
-                self.current.append(p)
-            elif len(self.current) >= 3:
-                # 更新拖动点
-                self.current[2] = p
-            self.update()
-            return
-        # 多边形: 累计路径点
         if not (e.buttons() & Qt.LeftButton): return
         if self.current:
             l = self.current[-1]
             if abs(l.x()-p.x())>5 or abs(l.y()-p.y())>5: self.current.append(p); self.update()
 
     def mouseReleaseEvent(self, e):
-        if self.drag_idx >= 0:
-            self.drag_idx = -1; self.drag_target = None
-            return
         if e.button() != Qt.LeftButton: return
-        # 画矩形过程松手 = 完成矩形
-        if self.mode in (self.MODE_ENTRY_ZONE, self.MODE_EXIT_ZONE):
-            if len(self.current) >= 3:
-                self._finish_zone()
+        if self.mode == self.MODE_MARKER_LINE:
             self.update()
             return
         if self.drawing and self.mode == self.MODE_POLYGON and len(self.current) > 2:
@@ -337,28 +306,12 @@ class PolygonDrawer(QWidget):
             self.polygons.append([self._to(pt) for pt in self.current])
         self.update()
 
-    def _finish_zone(self):
-        """根据 current = [p1_disp, p2_disp, drag_disp] 计算 4 点矩形 (保证直角)
-           1) p1, p2 是外侧边
-           2) drag_disp 投影到外侧边法向上得 p3
-           3) p4 = p2 + (p3 - p1)
-        """
-        if len(self.current) < 3: return
+    def _finish_marker_line(self):
+        """标记线 2 点已选，自动计算入/出标记区域。"""
+        if len(self.current) < 2: return
         p1 = self._to(self.current[0]); p2 = self._to(self.current[1])
-        drag = self._to(self.current[2])
-        # drag -> p3 (投影到外侧边法向上)
-        dx = p2[1] - p1[1]; dy = -(p2[0] - p1[0])
-        L = (dx*dx + dy*dy) ** 0.5
-        if L < 1: return
-        ux, uy = dx/L, dy/L
-        # p3 = p1 + ux*((drag-p1)·n) , n=(ux,uy)
-        proj = (drag[0]-p1[0])*ux + (drag[1]-p1[1])*uy
-        p3 = (int(round(p1[0] + ux*proj)), int(round(p1[1] + uy*proj)))
-        p4 = (p2[0] + p3[0] - p1[0], p2[1] + p3[1] - p1[1])
-        if self.mode == self.MODE_ENTRY_ZONE:
-            self.entry_zone = [p1, p2, p3, p4]
-        else:
-            self.exit_zone = [p1, p2, p3, p4]
+        self.marker_line = [p1, p2]
+        self.entry_zone, self.exit_zone = self._compute_marker_zones(p1, p2)
         self.current = []
         self.drawing = False
         self.update()
@@ -381,13 +334,13 @@ class PolygonDrawer(QWidget):
             for poly in self.polygons:
                 p.drawPolygon(QPolygon([self._td(x,y) for x,y in poly]))
 
-        # 入口矩形 (绿) + 出口矩形 (红)
-        # 存储顺序: zone = [p1, p2, p3, p4]  p1->p2 外侧边(绊线), p3->p4 内侧边
+        # 入标记区域 (绿) + 出标记区域 (红)
+        # 存储顺序: zone = [p1, p2, p3, p4]  p1->p2 标记线(外侧边), p3->p4 内侧边
         # 矩形顶点绘制顺序必须为 p1 -> p2 -> p4 -> p3 (顺时针或逆时针), 不能 p1->p2->p3->p4
         # 否则 Qt drawPolygon 会画成 2 个三角形
         for zone, fill, col, label in [
-            (self.entry_zone, QColor(0,255,0,50), QColor(0,160,0), "入口区域"),
-            (self.exit_zone,  QColor(255,0,0,50), QColor(160,0,0), "出口区域"),
+            (self.entry_zone, QColor(0,255,0,50), QColor(0,160,0), "入标记区域"),
+            (self.exit_zone,  QColor(255,0,0,50), QColor(160,0,0), "出标记区域"),
         ]:
             if zone and len(zone) == 4:
                 # 顶点顺序: p1, p2, p4, p3 (跳过 p3 到 p4 的对角)
@@ -400,10 +353,10 @@ class PolygonDrawer(QWidget):
                 # 4 边
                 p.setPen(QPen(col, 2))
                 p.drawPolygon(QPolygon(pts_disp))
-                # 4 角点 (拖动手柄) - 用 zone 原顺序 p1,p2,p3,p4 让用户能看到每个角的功能
-                for x, y in zone:
-                    p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
-                    p.drawEllipse(self._td(x, y), 5, 5)
+                # 标记线端点 (p1/p2) 高亮
+                p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
+                p.drawEllipse(self._td(*zone[0]), 5, 5)
+                p.drawEllipse(self._td(*zone[1]), 5, 5)
                 # 标签
                 cx = sum(x for x,y in zone) // 4
                 cy = sum(y for x,y in zone) // 4
@@ -411,76 +364,36 @@ class PolygonDrawer(QWidget):
                 p.setPen(QPen(col, 1))
                 p.drawText(tp.x()-20, tp.y()+5, label)
 
-        # 画矩形过程中: 显示预览 (绊线已画完, 拖动显示矩形)
-        if self.drawing and self.mode in (self.MODE_ENTRY_ZONE, self.MODE_EXIT_ZONE) and self.current:
-            col = QColor(0,255,0) if self.mode == self.MODE_ENTRY_ZONE else QColor(255,0,0)
-            fill = QColor(0,255,0,50) if self.mode == self.MODE_ENTRY_ZONE else QColor(255,0,0,50)
+        # 标记线 (黄, 高亮)
+        if self.marker_line and len(self.marker_line) == 2:
+            p.setPen(QPen(QColor(255,255,0), 3))
+            p.drawLine(self._td(*self.marker_line[0]), self._td(*self.marker_line[1]))
+
+        # 画标记线过程中: 显示预览 (1 个点已放, 提示再点一次)
+        if self.drawing and self.mode == self.MODE_MARKER_LINE and self.current:
             p1d = self.current[0]
-            # 已放点
-            p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
+            p.setBrush(QColor(255,255,255)); p.setPen(QPen(QColor(255,255,0), 2))
             p.drawEllipse(p1d, 5, 5)
-            p2d = None
-            if len(self.current) >= 2:
-                p2d = self.current[1]
-                p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
-                p.drawEllipse(p2d, 5, 5)
-                p.setPen(QPen(col, 2))
-                p.drawLine(p1d, p2d)
-            if len(self.current) >= 3 and p2d is not None:
-                # 拖动期间: 用拖动点 (mouse pos) 实时算矩形 (沿外侧边法向投影)
-                p1 = self._to(p1d); p2 = self._to(p2d); drag = self._to(self.current[2])
-                dx = p2[1] - p1[1]; dy = -(p2[0] - p1[0])
-                L = (dx*dx + dy*dy) ** 0.5
-                if L >= 1:
-                    ux, uy = dx/L, dy/L
-                    proj = (drag[0]-p1[0])*ux + (drag[1]-p1[1])*uy
-                    p3 = (p1[0] + ux*proj, p1[1] + uy*proj)
-                    p4 = (p2[0] + p3[0] - p1[0], p2[1] + p3[1] - p1[1])
-                    # 顶点顺序: p1, p2, p4, p3 (矩形正确路径, 不是 Z 字形)
-                    pts_disp = [self._td(*p1), self._td(*p2),
-                                self._td(*p4), self._td(*p3)]
-                    path = QPainterPath(); path.moveTo(pts_disp[0])
-                    for pp in pts_disp[1:]: path.lineTo(pp)
-                    path.closeSubpath()
-                    p.fillPath(path, fill)
-                    p.setPen(QPen(col, 2))
-                    p.drawPolygon(QPolygon(pts_disp))
-                    # 显示深度 (在矩形中心)
-                    label = f"{int(round(proj))}px" if abs(proj) >= 1 else ""
-                    if label:
-                        # 矩形中心 = (p1+p2+p3+p4)/4
-                        cx = (p1[0]+p2[0]+p3[0]+p4[0])//4
-                        cy = (p1[1]+p2[1]+p3[1]+p4[1])//4
-                        tp = self._td(cx, cy)
-                        p.setPen(QPen(col, 1))
-                        p.drawText(tp.x()-15, tp.y()+5, label)
-            # 提示文字
-            p.setPen(QPen(col, 1))
-            if len(self.current) == 1:
-                hint = "绊线起点已放, 再点一次 = 绊线终点"
-            elif len(self.current) == 2:
-                hint = "绊线已画完, 拖动鼠标 = 拉矩形宽度 (松手完成)"
-            else:
-                hint = "拖动鼠标调整宽度, 松手完成"
-            anchor = self.current[-1]
-            p.drawText(anchor.x()+10, anchor.y()-10, hint)
+            p.drawText(p1d.x()+10, p1d.y()-10, "标记线起点已放, 再点一次 = 标记线终点")
 
         if len(self.current) > 1 and self.mode == self.MODE_POLYGON:
                 p.setPen(QPen(QColor(0,255,0), 2)); p.drawPolyline(QPolygon(self.current))
                 if len(self.current) > 2: p.drawLine(self.current[-1], self.current[0])
 
     def clear(self):
-        self.polygons = []; self.entry_zone = None; self.exit_zone = None; self.update()
+        self.polygons = []; self.entry_zone = None; self.exit_zone = None
+        self.marker_line = None; self.update()
     def delete_last(self):
         if self.polygons: self.polygons.pop(); self.update()
     def set_polygons(self, ps, ow, oh):
         sx = self.ow/ow if ow>0 else 1; sy = self.oh/oh if oh>0 else 1
         self.polygons = [[(int(x*sx),int(y*sy)) for x,y in p] for p in ps]; self.update()
     def set_zones(self, entry_zone, exit_zone, ow, oh):
-        """设置 4 点矩形 (来自配置)"""
+        """设置 4 点矩形 (来自配置)，并据此重建标记线"""
         sx = self.ow/ow if ow>0 else 1; sy = self.oh/oh if oh>0 else 1
         if entry_zone and len(entry_zone) == 4:
             self.entry_zone = [(int(x*sx),int(y*sy)) for x,y in entry_zone]
+            self.marker_line = [self.entry_zone[0], self.entry_zone[1]]
         if exit_zone and len(exit_zone) == 4:
             self.exit_zone = [(int(x*sx),int(y*sy)) for x,y in exit_zone]
         self.update()
@@ -582,8 +495,7 @@ class MainWindow(QMainWindow):
 
         r = QHBoxLayout()
         b = QPushButton("画区域"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_POLYGON)); r.addWidget(b)
-        b = QPushButton("画入口矩形"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_ENTRY_ZONE)); r.addWidget(b)
-        b = QPushButton("画出口矩形"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_EXIT_ZONE)); r.addWidget(b)
+        b = QPushButton("画标记线"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_MARKER_LINE)); r.addWidget(b)
         pl.addLayout(r)
         
         r = QHBoxLayout()
@@ -591,21 +503,8 @@ class MainWindow(QMainWindow):
         b = QPushButton("清空全部"); b.clicked.connect(lambda:self.drawer.clear()); r.addWidget(b)
         pl.addLayout(r)
 
-        # 注: 区域深度控件已废弃, 改用 4 点矩形
-        # r = QHBoxLayout()
-        # r.addWidget(QLabel("入口区域深度:"))
-        # self.entry_depth_spin = QSpinBox(); self.entry_depth_spin.setRange(0,200)
-        # self.entry_depth_spin.setValue(0); self.entry_depth_spin.setSuffix(" px")
-        # self.entry_depth_spin.valueChanged.connect(lambda v: setattr(self.drawer,'entry_zone_depth',v) or self.drawer.repaint())
-        # r.addWidget(self.entry_depth_spin)
-        # r.addWidget(QLabel("出口区域深度:"))
-        # self.exit_depth_spin = QSpinBox(); self.exit_depth_spin.setRange(0,200)
-        # self.exit_depth_spin.setValue(0); self.exit_depth_spin.setSuffix(" px")
-        # self.exit_depth_spin.valueChanged.connect(lambda v: setattr(self.drawer,'exit_zone_depth',v) or self.drawer.repaint())
-        # r.addWidget(self.exit_depth_spin)
-        # pl.addLayout(r)
-
-        pl.addWidget(QLabel("左键拖动画区域 | 左键拖动画绊线 | 运行时加 -r 启用逆行检测"))
+        pl.addWidget(QLabel("步骤: 1)先画检测区域(多边形)  2)在区域边界点2点=标记线"))
+        pl.addWidget(QLabel("自动: 入标记区域=向区域内100px | 出标记区域=向区域外50px"))
         b = QPushButton("保存当前"); b.clicked.connect(self._save_cur); pl.addWidget(b)
         pg.setLayout(pl); cl.addWidget(pg)
         cl.addStretch()
@@ -671,14 +570,18 @@ class MainWindow(QMainWindow):
                     for token in rest:
                         if token.startswith('t1,'):
                             parts=token[3:].replace(',',' ').split()
-                            # 老格式 5 参: t1,x1,y1,x2,y2,depth
-                            # 自动换算成 4 点矩形 (外侧边 + depth 反向拓展)
+                            # 标记线 5 参: t1,x1,y1,x2,y2,depth
+                            # depth 符号表入侧方向, |depth|=入标记区域深度
                             if len(parts) >= 5:
                                 d = int(parts[4])
                                 p1 = (int(parts[0]), int(parts[1]))
                                 p2 = (int(parts[2]), int(parts[3]))
                                 p3, p4 = _rect_from_line_depth(p1, p2, d)
                                 entry = [p1, p2, p3, p4]
+                                # 出标记区域 = 标记线向检测区外(反方向)延伸 EXIT_MARKER_DEPTH
+                                exit_d = EXIT_MARKER_DEPTH if d < 0 else -EXIT_MARKER_DEPTH
+                                e3, e4 = _rect_from_line_depth(p1, p2, exit_d)
+                                exit = [p1, p2, e3, e4]
                             elif len(parts) >= 4:
                                 p1 = (int(parts[0]), int(parts[1]))
                                 p2 = (int(parts[2]), int(parts[3]))
@@ -813,16 +716,12 @@ class MainWindow(QMainWindow):
                     xs = [pt[0] for pt in poly]; ys = [pt[1] for pt in poly]
                     if max(xs)==0 and max(ys)==0: continue
                     lp.append('['+' '.join(f"{x},{y}" for x,y in poly)+']')
-                # 入口矩形 4 点 -> 换算成 5 参格式 (外侧边 + 平均深度)
+                # 标记线 4 点(入标记区域) -> 换算成 5 参格式 (标记线 + 带符号入深度)
+                # 出标记区域(50px) 由 C++ 端按入深度反方向固定延伸，无需单独存储。
                 if c.get('entry_zone') and len(c['entry_zone']) == 4:
                     line, depth = _rect_to_line_depth(c['entry_zone'])
                     if line:
                         lp.append(f"t1,{line[0][0]},{line[0][1]},{line[1][0]},{line[1][1]},{depth}")
-                # 出口矩形 4 点 -> 换算成 5 参格式
-                if c.get('exit_zone') and len(c['exit_zone']) == 4:
-                    line, depth = _rect_to_line_depth(c['exit_zone'])
-                    if line:
-                        lp.append(f"t2,{line[0][0]},{line[0][1]},{line[1][0]},{line[1][1]},{depth}")
                 f.write(' '.join(lp)+'\n')
         QMessageBox.information(self,"ok",f"已保存: {p}"); self.cfg_path=p
 

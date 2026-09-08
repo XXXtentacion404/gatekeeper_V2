@@ -48,6 +48,12 @@ public:
                                      std::vector<Detection>& detections,
                                      int64_t* capture_timestamp_ms = nullptr);
 
+    // 新增：阻塞等待最新结果（用条件变量代替 sleep 忙等待，降低 CPU）。
+    // timeout_ms 内无结果返回 NN_TIMEOUT；有结果等价于 tryGetLatestResultRaw。
+    nn_error_e waitLatestResultRaw(cv::Mat& img, int& out_id, int& box_count,
+                                   std::vector<Detection>& detections,
+                                   int64_t* capture_timestamp_ms, int timeout_ms);
+
     void stopAll();
     Stats getStats() const;
 
@@ -66,6 +72,7 @@ private:
     std::condition_variable cv_task;
     std::atomic<bool> stop;
     mutable std::mutex mtx2;
+    std::condition_variable cv_result;   // 结果就绪通知（worker 插入后 notify_all）
     std::map<int, std::vector<Detection>> results;
     std::map<int, int64_t> capture_timestamps_ms_;
     std::map<int, cv::Mat> img_results;      // 保存原始图像（未绘制）

@@ -34,7 +34,7 @@
 #include "yolov8_custom.h"
 #include "yolov8_thread_pool.h"
 #include "bytetrack/tracker.h"
-#include "tripwire_counter.h"
+#include "gate_id_counter.h"
 #include "mask_utils.h"
 #include "comm.h"
 
@@ -54,40 +54,9 @@ const int MAX_CAMERAS = 4;
 std::atomic<uint16_t> g_max_box_count(0);
 std::atomic<bool> g_need_clear_queues{false};
 
-// ==================== 双摄像头融合去重 ====================
-struct FusedEvent {
-    int64_t ts_ms;       // 事件毫秒时间戳
-    int cam_idx;         // 摄像头索引 0/1
-    int event_type;      // 0=IN, 1=OUT, 2=RETRO
-    int line_type;       // 1=ENTRY, 2=EXIT，避免两种RETRO互相误配
-};
-std::deque<FusedEvent> g_event_queue;
-std::mutex g_event_mutex;
-std::atomic<int> g_fused_in{0};
-std::atomic<int> g_fused_out{0};
-std::atomic<int> g_fused_retro{0};
-static const int64_t DEDUP_WINDOW_MS = 1200; // 实测双摄同一事件最大延迟约1079ms
-
-bool reportFusedEvent(int cam_idx, int event_type, int line_type, int64_t capture_ms) {
-    const auto now_ms = capture_ms;
-    std::lock_guard<std::mutex> lk(g_event_mutex);
-    while (!g_event_queue.empty() && (now_ms - g_event_queue.front().ts_ms) > DEDUP_WINDOW_MS)
-        g_event_queue.pop_front();
-    bool found = false;
-    for (auto it = g_event_queue.begin(); it != g_event_queue.end(); ) {
-        if (it->event_type == event_type && it->line_type == line_type
-            && it->cam_idx != cam_idx) {
-            std::cerr << "[FUSE_MATCH] type="
-                      << (event_type == 0 ? "IN" : (event_type == 1 ? "OUT" : "RETRO"))
-                      << " line=" << (line_type == 1 ? "ENTRY" : "EXIT")
-                      << " cams=" << it->cam_idx << "+" << cam_idx
-                      << " dt=" << (now_ms - it->ts_ms) << "ms\n";
-            it = g_event_queue.erase(it); found = true; break;
-        } else { ++it; }
-    }
-    if (!found) g_event_queue.push_back({now_ms, cam_idx, event_type, line_type});
-    return !found;
-}
+// 双向闸机 + 每摄像头独立计数：201 计 IN/RETRO，200 计 RETRO/OUT，
+// 每个 ByteTrack ID 至多一次"进入类"+一次"离开类"事件，无需双摄融合去重
+// （旧 reportFusedEvent / g_fused_* 已移除）。
 
 // ==================== 摄像头配置 ====================
 struct CameraConfig {
@@ -115,14 +84,15 @@ struct CameraConfig {
     cv::Mat detection_mask;
     cv::Mat mask_overlay;
     
-    // 绊线区域（人行方向统计）
-    Tripwire entry_line;
-    Tripwire exit_line;
-    float entry_zone_depth = 50.0f;  // 入口区域深度(px), 绊线向内延伸
-    float exit_zone_depth = 50.0f;   // 出口区域深度(px)
-    std::atomic<int> forward_count{0};    // 顺行累计
-    std::atomic<int> exit_count{0};       // 出门累计
-    std::atomic<int> retrograde_count{0}; // 逆行累计
+    // 标记线区域（单向闸机：单标记线 + 出入标记区域）
+    Tripwire entry_line;             // 进出标记线（config 里 t1）
+    Tripwire exit_line;              // 保留字段（新逻辑不使用）
+    float entry_zone_depth = 100.0f; // 入标记区域深度(px)：标记线向检测区内延伸
+    float exit_zone_depth = 50.0f;   // 出标记区域深度(px)：标记线向检测区外延伸
+    int role = 0;                    // 0=入口摄像头(201) 1=出口摄像头(200)
+    std::atomic<int> in_count{0};    // 进入累计
+    std::atomic<int> out_count{0};   // 离开累计
+    std::atomic<int> retro_count{0}; // 逆行累计
     
     std::deque<int> recent_counts;
     std::mutex count_mutex;
@@ -154,8 +124,9 @@ struct CameraConfig {
           mask_overlay(std::move(o.mask_overlay)),
           entry_line(o.entry_line), exit_line(o.exit_line),
           entry_zone_depth(o.entry_zone_depth), exit_zone_depth(o.exit_zone_depth),
-          forward_count(o.forward_count.load()), exit_count(o.exit_count.load()),
-          retrograde_count(o.retrograde_count.load()),
+          role(o.role),
+          in_count(o.in_count.load()), out_count(o.out_count.load()),
+          retro_count(o.retro_count.load()),
           recent_counts(std::move(o.recent_counts)), filtered_count(o.filtered_count),
           zone_count(o.zone_count.load())
     { o.send_db = nullptr; o.g_nPort = -1; }
@@ -238,8 +209,9 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
         cc.detection_mask = createDetectionMask(c.width, c.height, c.detection_zones);
         cc.entry_line = c.entry_line;
         cc.exit_line = c.exit_line;
-        cc.entry_zone_depth = c.entry_zone_depth;  // 用户画的区域深度, 0=线模式
-        cc.exit_zone_depth = c.exit_zone_depth;
+        cc.entry_zone_depth = c.entry_zone_depth;  // 入标记区域深度(带符号表入侧方向)
+        cc.exit_zone_depth = c.exit_zone_depth;    // 出标记区域深度
+        if (cc.exit_zone_depth < 1.0f) cc.exit_zone_depth = 50.0f;  // 出标记区域默认50px
         if (!cc.detection_mask.empty()) {
             std::vector<std::vector<cv::Point>> ct;
             cv::findContours(cc.detection_mask, ct, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -248,6 +220,13 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
         }
         std::string base = c.ip + "_Ch" + std::to_string(c.channel);
         cc.unique_id = base + "_" + std::to_string(++cnt[base]);
+        // 相机角色：IP 末段 200=出口摄像头(只计OUT)，201=入口摄像头(只计IN)。
+        {
+            std::string tail = c.ip;
+            auto dot = tail.find_last_of('.');
+            if (dot != std::string::npos) tail = tail.substr(dot + 1);
+            cc.role = (tail == "200") ? 1 : 0;  // 默认入口（含 201 及其他）
+        }
         out.emplace_back(std::move(cc));
     }
     return out;
@@ -312,46 +291,13 @@ void processCamera(CameraConfig& cfg) {
     uint64_t last_perf_decode_seq = 0;
     int last_submitted_frame_id = -1;
     int last_processed_result_id = -1;
-    // Legacy state declarations are kept below for display compatibility.
-    enum CrossLine { CL_NONE = 0, CL_ENTRY = 1, CL_EXIT = 2 };
-    static const int TRACK_REARM_GAP_FRAMES = 4;   // 轨迹断裂 >=4 帧即重臂(与 HEAD 一致)
-    struct CrossState {
-        std::deque<cv::Point2f> trail;
-        CrossLine first_line = CL_NONE;
-        int first_frame = 0;
-        cv::Point2f first_pt;
-        cv::Point2f last_foot;
-        int side_entry = 0;
-        int side_exit = 0;
-        int cooldown_entry = 0;  // 入口线计数后冷却帧数
-        int cooldown_exit = 0;   // 出口线计数后冷却帧数
-        bool virt_entry_done = false;  // 轨迹虚拟入口只触发一次
-        bool virt_exit_done = false;   // 轨迹虚拟出口只触发一次
-        bool entry_seen = false;       // 已真实或虚拟经过入口，禁止后续虚拟出口误判
-        CrossLine last_cross_line = CL_NONE;  // 最近跨的线(画面闪烁用)
-        int flash_frames = 0;                  // 闪烁剩余帧数
-        int lost_frames = 0;
-        int age_frames = 0;                    // track 从本次出现开始累计的有效帧数
-        bool armed_from_outside = false;        // 入口: 先确认人在检测区外, 再允许入区计数
-        int inside_zone_frames = 0;
-        int outside_zone_frames = 0;
-        // 检测区(脚底跳变)计数字段
-        int region = 0;             // 当前区域 0区域外 1入口区域 2检测区 3出口区域
-        int enter_side = 0;
-        int exit_side = 0;
-        int cooldown_zone = 0;
-        bool last_was_retro = false;
-        int last_event = 0;
-    };
-    std::map<int, CrossState> cs_map;
-    enum { S_OUT, S_ENTER, S_IN, S_LEAVE };
-    struct TM { int s = S_OUT; int n = 0; cv::Point2f p; int out_n = 0; };
-    std::map<int, TM> zone_states;
-    TripwireCounter tripwire_counter(cfg.entry_line, cfg.exit_line,
-                                     cfg.entry_zone_depth, cfg.exit_zone_depth,
-                                     cfg.detection_mask);
-    tripwire_counter.setDebugEnabled(g_enable_zone_trace);
-    // (注: 区域/带符号距离判定已全部收拢到 TripwireCounter, 此处不再有本地几何 lambda)
+    // 双向闸机计数（与 ByteTrack ID 绑定）。标记线 = cfg.entry_line(t1)。
+    // 每个摄像头都做双向判定：外→内=进入类，内→外消失=离开类，角色决定标签。
+    // 201(入口)：外→内=IN，内→外消失=RETRO；200(出口)：外→内=RETRO，内→外消失=OUT。
+    GateIdCounter gate_counter(cfg.role == 1 ? GATE_ROLE_EXIT : GATE_ROLE_ENTRY,
+                               cfg.entry_line,
+                               cfg.entry_zone_depth, cfg.exit_zone_depth);
+    int gate_flash = 0;  // 计数事件后的标记线闪烁帧数
 
     while (!cfg.stop_flag && g_running) {
         {
@@ -368,9 +314,10 @@ void processCamera(CameraConfig& cfg) {
 
         cv::Mat raw; int rid=0, rbc=0; int64_t capture_ms = 0;
         std::vector<Detection> dets;
-        if (cfg.yolov8_pool->tryGetLatestResultRaw(raw, rid, rbc, dets,
-                                                   &capture_ms) != NN_SUCCESS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue;
+        // 阻塞等待最新推理结果（条件变量，非 sleep 忙等待）。20ms 超时回顶部提交新帧。
+        if (cfg.yolov8_pool->waitLatestResultRaw(raw, rid, rbc, dets,
+                                                 &capture_ms, 20) != NN_SUCCESS) {
+            continue;
         }
         if (rid <= last_processed_result_id) continue;
         last_processed_result_id = rid;
@@ -393,111 +340,44 @@ void processCamera(CameraConfig& cfg) {
             track.result_frame_id = rid;
             track.capture_timestamp_ms = capture_ms;
         }
-        // Zone count with ByteTrack ID continuity.
-        for (auto it = zone_states.begin(); it != zone_states.end(); ) {
-            bool al = false;
-            for (auto& t : tracks) if (t.track_id == it->first) { al = true; break; }
-            if (!al && it->second.s <= S_ENTER) it = zone_states.erase(it);
-            else if (!al && it->second.n++ > 60) it = zone_states.erase(it);
-            else ++it;
-        }
+        // 检测区域内人数（脚底在检测区域 mask 内），仅用于显示。
         int zn = 0;
-        for (auto& t : tracks) {
-            int tid = t.track_id;
-            auto& m = zone_states[tid];
-            cv::Point2f c(t.box.x+t.box.width/2.0f, t.box.y+t.box.height*0.92f);
-            // 区域内 = 同时在 entry 矩形内 AND exit 矩形内 (用户画的两根矩形围成的通道)
-            bool inZ = tripwire_counter.inZone(c);
-            switch (m.s) {
-            case S_OUT: case S_ENTER:
-                if (inZ) { m.n++; if (m.n>=2) { m.s=S_IN; m.p=c; m.n=0; } }
-                else { m.s=S_OUT; m.n=0; } break;
-            case S_IN:
-                if (!inZ) {
-                    if (cv::norm(c-m.p)>80) { m.s=S_LEAVE; m.n=1; m.out_n=1; }
-                } else { m.p=c; m.out_n=0; } break;
-            case S_LEAVE:
-                if (!inZ) {
-                    m.n++; m.out_n++;
-                    // 快速离开判定: 用脚底点判定是否仍在通道内 (0/1)
-                    bool fast_exit = (m.out_n>=4 && !tripwire_counter.inZone(c));
-                    if (fast_exit || m.n>=8) { m.s=S_OUT; m.n=0; }
-                } else { m.s=S_IN; m.p=c; m.n=0; m.out_n=0; } break;
+        if (!cfg.detection_mask.empty()) {
+            for (const auto& t : tracks) {
+                int cx = t.box.x + t.box.width / 2;
+                int cy = t.box.y + (int)(t.box.height * 0.92f);
+                cx = std::max(0, std::min(cx, cfg.detection_mask.cols - 1));
+                cy = std::max(0, std::min(cy, cfg.detection_mask.rows - 1));
+                if (cfg.detection_mask.at<uchar>(cy, cx) != 0) zn++;
             }
-            if (m.s==S_IN || m.s==S_LEAVE) zn++;
         }
         cfg.zone_count = zn;
         cfg.mode_count = cfg.calculateMode(zn);
         cfg.total_count = (int)tracks.size();
 
-        // ==================== 检测区(区域状态机)计数 ====================
-        // 区域模型: 0区域外 1入口区域 2检测区(入口线↔出口线走廊) 3出口区域
-        // 触发: 脚底所在"区域"的跳变(4帧平滑后), 进入/离开检测区即计(保留双摄融合).
-        //   IN  : 非出口侧 -> 进入检测区   (区域外/入口区域 侧进)
-        //   RETRO: 出口区域侧 -> 进入检测区 (逆行进)
-        //   OUT  : 离开检测区 -> 出口区域/区域外
-        //   RETRO: 离开检测区 -> 入口区域   (逆行出)
-        // 首帧仅建立区域(不计数); 若一出生已在检测区, 按所处半区推断方向补计.
-        // (实现全部在 TripwireCounter::update 内, 原 if(false&&...) 死代码块已清除)
-
-        // Shared counter: only real observations can create an event.
-        auto counter_events = tripwire_counter.update(tracks);
-        if (g_enable_zone_trace) {
-        auto trace_events = tripwire_counter.takeDebugEvents();
-        for (const auto& trace : trace_events) {
-            auto ts = capture_ms;
-            std::cerr << "[ZONE_TRACE] ts=" << ts << " " << cfg.unique_id
-                      << " track=" << trace.track_id
-                      << " reason=" << trace.reason
-                      << " raw=" << trace.raw_region
-                      << " stable=" << trace.stable_region
-                      << " pending=" << trace.pending_region
-                      << " pending_n=" << trace.pending_frames
-                      << " approach=" << trace.approach_side
-                      << " approach_n=" << trace.approach_observations
-                      << " departure=" << trace.departure_side
-                      << " departure_n=" << trace.departure_observations
-                      << " committed=" << (trace.inside_committed ? 1 : 0)
-                      << " observed_n=" << trace.observed_streak
-                      << " hit=" << trace.hit_streak
-                      << " lost=" << trace.lost_frames
-                      << " conf=" << trace.confidence
-                      << " move=" << trace.movement
-                      << " foot=(" << trace.foot.x << "," << trace.foot.y << ")\n";
-        }
-        } else {
-            tripwire_counter.takeDebugEvents();
-        }
-        for (const auto& event : counter_events) {
-            auto ts = capture_ms;
-            if (event.type == TW_EVENT_IN) {
-                cfg.forward_count++;
-                if (reportFusedEvent(cfg.cam_index, 0, 1, capture_ms)) g_fused_in++;
-            } else if (event.type == TW_EVENT_OUT) {
-                cfg.exit_count++;
-                if (reportFusedEvent(cfg.cam_index, 1, 2, capture_ms)) g_fused_out++;
+        // ==================== 双向闸机计数（与 ByteTrack ID 绑定）====================
+        // 201(入口)：外→内=IN，内→外消失=RETRO；200(出口)：外→内=RETRO，内→外消失=OUT。
+        // 遮挡期间 ByteTrack 保持同一 ID 预测输出，不会重复计数；只有 ID 真正消失才结算。
+        auto gate_events = gate_counter.update(tracks);
+        for (const auto& event : gate_events) {
+            gate_flash = 15;
+            const char* name = nullptr;
+            if (event.type == GATE_EVENT_IN) {
+                cfg.in_count++;
+                name = "IN";
+            } else if (event.type == GATE_EVENT_OUT) {
+                cfg.out_count++;
+                name = "OUT";
             } else {
-                cfg.retrograde_count++;
-                int line = event.side == 2 ? 2 : 1;
-                if (reportFusedEvent(cfg.cam_index, 2, line, capture_ms)) g_fused_retro++;
+                cfg.retro_count++;
+                name = "RETRO";
             }
-            std::cerr << "[ZONE] ts=" << ts << " " << cfg.unique_id
-                      << " track=" << event.track_id
-                      << " event=" << (event.type == TW_EVENT_IN ? "IN" :
-                                         event.type == TW_EVENT_OUT ? "OUT" : "RETRO")
-                      << " side=" << (event.side == 1 ? "entry" : "exit")
-                      << " source=" << (event.birth_confirmed
-                                             ? "region-birth-confirmed"
-                                             : event.loss_confirmed
-                                                   ? "region-loss-confirmed"
-                                                   : "region-transition")
-                      << " observed=" << (event.loss_confirmed ? 0 : 1)
-                      << " conf=" << event.confidence
-                      << " move=" << event.movement
+            std::cerr << "[GATE] ts=" << capture_ms << " " << cfg.unique_id
+                      << " track=" << event.track_id << " event=" << name
                       << " foot=(" << event.foot.x << "," << event.foot.y << ")"
-                      << " IN:" << cfg.forward_count.load()
-                      << " OUT:" << cfg.exit_count.load()
-                      << " RETRO:" << cfg.retrograde_count.load() << "\n";
+                      << " IN:" << cfg.in_count.load()
+                      << " OUT:" << cfg.out_count.load()
+                      << " RETRO:" << cfg.retro_count.load() << "\n";
         }
         if (g_enable_display &&
             (++display_result_counter % kDisplayEveryResults == 0)) {
@@ -539,26 +419,21 @@ void processCamera(CameraConfig& cfg) {
                 cv::putText(dp, dz, cv::Point((int)mid.x-22,(int)mid.y),
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, fill*0.8, 1);
             };
-            // 两个区域都按各自矩形深度 (带符号) 朝外侧边法向方向拉
+            // 入标记区域(绿, 向检测区内) + 出标记区域(红, 向检测区外) + 标记线
             drawZone(cfg.entry_line, cfg.entry_zone_depth, cv::Scalar(0,160,0));
-            drawZone(cfg.exit_line, cfg.exit_zone_depth, cv::Scalar(0,0,160));
+            drawZone(cfg.entry_line, -cfg.exit_zone_depth, cv::Scalar(0,0,160));
             drawTripLine(cfg.entry_line, cv::Scalar(0,255,0));
-            drawTripLine(cfg.exit_line, cv::Scalar(0,0,255));
         }
-        // 轨迹调试: 脚底点 + 跨线闪烁
+        // 轨迹调试: 脚底点 + 计数闪烁
         {
             float sx = (float)cfg.display_w / raw.cols;
             float sy = (float)cfg.display_h / raw.rows;
-            // 跨线闪烁: 遍历cs_map, 刚刚跨的线画亮色
-            for (auto& kv : cs_map) {
-                if (kv.second.flash_frames > 0) {
-                    kv.second.flash_frames--;
-                    const Tripwire& tw = (kv.second.last_cross_line == CL_ENTRY)
-                        ? cfg.entry_line : cfg.exit_line;
-                    cv::Point p1((int)(tw.p1.x*sx), (int)(tw.p1.y*sy));
-                    cv::Point p2((int)(tw.p2.x*sx), (int)(tw.p2.y*sy));
-                    cv::line(dp, p1, p2, cv::Scalar(0,255,255), 5, cv::LINE_AA);  // 亮青闪烁
-                }
+            // 计数事件后闪烁标记线
+            if (gate_flash > 0) {
+                gate_flash--;
+                cv::Point p1((int)(cfg.entry_line.p1.x*sx), (int)(cfg.entry_line.p1.y*sy));
+                cv::Point p2((int)(cfg.entry_line.p2.x*sx), (int)(cfg.entry_line.p2.y*sy));
+                cv::line(dp, p1, p2, cv::Scalar(0,255,255), 5, cv::LINE_AA);  // 亮青闪烁
             }
             // 脚底点
             for (auto& t : tracks) {
@@ -570,10 +445,10 @@ void processCamera(CameraConfig& cfg) {
         std::string info1 = cfg.unique_id + " Zone:" + std::to_string(zn)
                           + " Tot:" + std::to_string((int)tracks.size());
         cv::putText(dp, info1, cv::Point(5, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,255,255), 1);
-        // 第二行：红色大字，IN / RETRO 跨线计数
-        std::string info2 = "IN:" + std::to_string(cfg.forward_count.load())
-                          + "  OUT:" + std::to_string(cfg.exit_count.load())
-                          + "  RETRO:" + std::to_string(cfg.retrograde_count.load());
+        // 第二行：红色大字，IN / OUT / RETRO 计数
+        std::string info2 = "IN:" + std::to_string(cfg.in_count.load())
+                          + "  OUT:" + std::to_string(cfg.out_count.load())
+                          + "  RETRO:" + std::to_string(cfg.retro_count.load());
         cv::putText(dp, info2, cv::Point(5, 42), cv::FONT_HERSHEY_SIMPLEX, 0.60, cv::Scalar(0,0,255), 2);
         { std::lock_guard<std::mutex> lk(cfg.display_ptr_mutex); cfg.display_frame_ptr = std::make_shared<cv::Mat>(dp); }
         }
@@ -591,9 +466,9 @@ void processCamera(CameraConfig& cfg) {
             const auto perf = cfg.yolov8_pool->getStats();
             std::cout << cfg.unique_id << " FPS:" << cfg.fps << " Zone:" << zn
                      << " Tot:" << tracks.size()
-                     << " IN:" << cfg.forward_count.load()
-                     << " OUT:" << cfg.exit_count.load()
-                     << " RETRO:" << cfg.retrograde_count.load()
+                     << " IN:" << cfg.in_count.load()
+                     << " OUT:" << cfg.out_count.load()
+                     << " RETRO:" << cfg.retro_count.load()
                      << std::endl;
             std::cout << "[PERF] " << cfg.unique_id
                       << " decode=" << decode_seq
@@ -674,13 +549,18 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (ok) {
-                    int max_zone = 0;
-                    for (auto& c : cameras) max_zone = std::max(max_zone, c.zone_count.load());
+                    int max_zone = 0, total_in = 0, total_out = 0, total_retro = 0;
+                    for (auto& c : cameras) {
+                        max_zone = std::max(max_zone, c.zone_count.load());
+                        total_in += c.in_count.load();
+                        total_out += c.out_count.load();
+                        total_retro += c.retro_count.load();
+                    }
                     char mx[64]; snprintf(mx, 64, "Max Zone: %d", max_zone);
                     cv::putText(comb, mx, cv::Point(5, 60),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,0,255), 1);
-                    char fused[64]; snprintf(fused, 64, "Fused IN:%d OUT:%d RETRO:%d",
-                                             g_fused_in.load(), g_fused_out.load(), g_fused_retro.load());
+                    char fused[64]; snprintf(fused, 64, "Total IN:%d OUT:%d RETRO:%d",
+                                             total_in, total_out, total_retro);
                     cv::putText(comb, fused, cv::Point(5, 80),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,0,255), 1);
                     cv::imshow(wn, comb);
@@ -693,9 +573,11 @@ int main(int argc, char** argv) {
     }
     for (auto& t : ths) if (t.joinable()) t.join();
     NET_DVR_Cleanup();
-    std::cout << "Fused Final IN:" << g_fused_in.load()
-              << " OUT:" << g_fused_out.load()
-              << " RETRO:" << g_fused_retro.load() << std::endl;
+    int total_in = 0, total_out = 0, total_retro = 0;
+    for (auto& c : cameras) { total_in += c.in_count.load(); total_out += c.out_count.load(); total_retro += c.retro_count.load(); }
+    std::cout << "Total Final IN:" << total_in
+              << " OUT:" << total_out
+              << " RETRO:" << total_retro << std::endl;
     std::cout << "V4 stopped." << std::endl;
     return 0;
 }
