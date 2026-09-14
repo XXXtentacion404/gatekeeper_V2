@@ -213,6 +213,29 @@ private:
                           const std::vector<cv::Mat>& det_hists,
                           std::vector<int>& track_match,
                           std::vector<int>& det_match);
+
+    /**
+     * 遮挡重连（二次关联，降低遮挡导致的 ID 切换）。
+     *
+     * 联合评分匹配依赖 IoU 预过滤（iou < 0.05 的配对直接丢弃），而遮挡期间
+     * 卡尔曼外推框与遮挡结束后的真实框可能完全不重叠 → 旧 track 失配、
+     * 同一个物理人被分配新 ID（= ID 切换）。这里在两轮匹配之后，对仍未匹配的
+     * track 与仍未匹配的高置信度检测，用「随失联帧数放大的搜索窗 + 运动一致性
+     * + 外观直方图」做二次贪心关联，把同一个人的检测重新挂回旧 ID。
+     *
+     * @param tracks          全部活跃 track（索引与 active_tracks_ 一致）
+     * @param free_track_idx  本轮尚未匹配的 track 索引
+     * @param dets            尚未匹配的高置信度检测（det_high 子集）
+     * @param det_hists       与 dets 对齐的外观直方图
+     * @param track_match     输出，尺寸 tracks.size()，值为 dets 下标或 -1
+     * @param det_match       输出，尺寸 dets.size()，值为 tracks 下标或 -1
+     */
+    void reassociateLost(const std::vector<Track>& tracks,
+                         const std::vector<int>& free_track_idx,
+                         const std::vector<Detection>& dets,
+                         const std::vector<cv::Mat>& det_hists,
+                         std::vector<int>& track_match,
+                         std::vector<int>& det_match);
     
     cv::Scalar getColor(int track_id);
 };

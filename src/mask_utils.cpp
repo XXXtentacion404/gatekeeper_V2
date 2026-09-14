@@ -38,7 +38,7 @@ std::vector<CameraConfigEntry> parseCameraConfig(const std::string& configFile) 
         
         size_t poly_start = (tokens.size() > 4 && tokens[4].find('*') != std::string::npos) ? 5 : 4;
         for (size_t i = poly_start; i < tokens.size(); i++) {
-            // 绊线: t1,x1,y1,x2,y2[,depth] 或 t2,x1,y1,x2,y2[,depth]
+            // 绊线: t1,x1,y1,x2,y2[,depth]（入口带基准线）
             if (tokens[i].rfind("t1,", 0) == 0) {
                 std::string body = tokens[i].substr(3);
                 std::replace(body.begin(), body.end(), ',', ' ');
@@ -48,14 +48,11 @@ std::vector<CameraConfigEntry> parseCameraConfig(const std::string& configFile) 
                 if (ps >> depth) config.entry_zone_depth = depth;
                 config.entry_line = Tripwire(x1, y1, x2, y2);
             }
+            // 出口绊线 t2 已废弃：出口区域删除后"检测区域之外 = 出口"，
+            // 这里保留对旧配置文件的兼容（解析但忽略），只提示一次。
             else if (tokens[i].rfind("t2,", 0) == 0) {
-                std::string body = tokens[i].substr(3);
-                std::replace(body.begin(), body.end(), ',', ' ');
-                std::istringstream ps(body);
-                float x1, y1, x2, y2, depth = 0;
-                ps >> x1 >> y1 >> x2 >> y2;
-                if (ps >> depth) config.exit_zone_depth = depth;
-                config.exit_line = Tripwire(x1, y1, x2, y2);
+                std::cout << "[WARN] t2 出口绊线已废弃并被忽略(检测区域之外即出口): "
+                          << tokens[i] << std::endl;
             }
             // 检测区域多边形 [x1,y1 x2,y2 ...]
             else if (tokens[i][0] == '[') {

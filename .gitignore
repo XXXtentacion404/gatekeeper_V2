@@ -1,24 +1,62 @@
+# ============================================================================
+# gatekeeper_V4 .gitignore
+# 原则：大体积资源 / 编译产物 / 含密码的凭据配置 一律不入库；
+#       小而关键的脚本与回归测试源码必须入库（仓库历史曾丢失过一次）。
+# 注意：gitignore 不支持行尾注释，注释只能单独成行。
+# ============================================================================
+
 # ==================== 本地记忆 / 学习日志（不入库）====================
 .workbuddy/
 .learnings/
 
 # ==================== 编译产物与中间检查 ====================
 build/
-build-check/
 
-# ==================== 大体积资源 ====================
+# 宿主侧 OpenCV 完整构建目录，体积极大（数百 MB）
+build-check/opencv-build/
+build-check/CMakeFiles/
+build-check/CMakeCache.txt
+
+# 由 run_host_tests.ps1 从 src/tracker.cpp 自动生成的对照版，属派生产物
+build-check/hosttest/tracker_noreid.cpp
+
+# 可执行文件与目标文件
+*.exe
+*.o
+*.obj
+
+# 注意：build-check/hosttest/ 下的测试源码
+#      （test_gate_counter.cpp / test_tracker_reid.cpp / stub/ / run_host_tests.ps1）
+#      刻意不忽略，必须入库。
+
+# ==================== 大体积资源：视频 / 图片素材 ====================
 vidoes/
 weights/
+vidoes/
+文档/
+build-check/
+__pycache__/
+# ==================== 权重与模型 ====================
+# 忽略模型、训练产物；但保留目录下的小脚本（如 onnx_to_rknn.py 转换脚本）
+weights/*
+!weights/*.py
 
-# ==================== 凭据配置（含摄像头密码，禁止入库）====================
-cameras_config.txt
-cameras_config_10.txt
+# ==================== 凭据与现场配置（含摄像头密码，禁止入库）====================
+# cameras_config.txt / cameras_config_10.txt 内含 admin 密码
+cameras_config*.txt
+
+# DR.txt 内含摄像头 IP + admin 密码 + 区域坐标，属现场配置散记
+DR.txt
 
 # ==================== 散记 / 临时文件 ====================
-DR.txt
 ssss
 src/2026年8月17日.txt
 *.log
+*.tmp
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
 
 # ==================== 幻灯片工具中间产物 ====================
 .slidep/

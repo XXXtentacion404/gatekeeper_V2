@@ -4,6 +4,27 @@
 #include <cstdlib>
 #include <ctime>
 
+namespace {
+// ---- 遮挡重连（二次关联）参数 ----
+// 搜索窗半径 = max(kReidBaseRadiusPx, kReidBoxRatio * 框最长边)
+//             + kReidPerLostPx * 已失联帧数，上限 kReidMaxRadiusPx。
+// 失联越久、人可能走得越远，窗口随之放大；但始终以"人不可能瞬移"为约束。
+constexpr float kReidBaseRadiusPx = 60.0f;
+constexpr float kReidBoxRatio     = 0.75f;
+constexpr float kReidPerLostPx    = 8.0f;
+constexpr float kReidMaxRadiusPx  = 260.0f;
+// 外观相关性硬门限（HSV 2D 直方图 HISTCMP_CORREL）。同一人不同帧普遍 >0.5，
+// 不同衣着的人普遍 <0.35；低于门限一律不关联，宁可让它新建 ID（避免 ID 盗用）。
+constexpr float kReidMinAppearance = 0.35f;
+// 综合评分：外观权重最高（遮挡重现身最可靠的线索），距离/运动作约束。
+constexpr float kReidWDist   = 0.20f;
+constexpr float kReidWMotion = 0.25f;
+constexpr float kReidWAppear = 0.55f;
+constexpr float kReidScoreThresh = 0.45f;
+// 帧为空/直方图不可用时的保守兜底（只能靠距离+运动，门限更高）
+constexpr float kReidScoreThreshNoAppear = 0.60f;
+}
+
 ByteTrackTracker::ByteTrackTracker(float track_thresh, float high_thresh,
                                  float match_thresh, int max_lost, int min_hits)
     : track_thresh_(track_thresh),
@@ -95,9 +116,10 @@ float ByteTrackTracker::calcJointScore(const Track& track, const Detection& det,
     float s_conf = det.confidence;
 
     // 权重：IoU主导 + 运动约束 + 外观辅助 + 置信度偏好
-    const float alpha = 0.40f;   // IoU
+    // 遮挡重现身靠外观重识别降 ID 切换，故 γ 0.20→0.25（α 0.40→0.35 补足，和仍 1.0）
+    const float alpha = 0.35f;   // IoU
     const float beta  = 0.25f;   // Motion
-    const float gamma = 0.20f;   // Appearance
+    const float gamma = 0.25f;   // Appearance
     const float delta = 0.15f;   // Confidence
 
     return alpha * s_iou + beta * s_motion + gamma * s_appear + delta * s_conf;
@@ -164,6 +186,88 @@ void ByteTrackTracker::greedyJointMatch(
             if (s >= score_thresh)
                 pairs.push_back({s, (int)i, (int)j});
         }
+
+    std::sort(pairs.begin(), pairs.end(),
+              [](const Pair& a, const Pair& b) { return a.score > b.score; });
+
+    std::vector<bool> t_used(tracks.size(), false);
+    std::vector<bool> d_used(dets.size(), false);
+    for (auto& p : pairs) {
+        if (!t_used[p.ti] && !d_used[p.di]) {
+            track_match[p.ti] = p.di;
+            det_match[p.di] = p.ti;
+            t_used[p.ti] = true;
+            d_used[p.di] = true;
+        }
+    }
+}
+
+// ==================== 遮挡重连（二次关联） ====================
+
+void ByteTrackTracker::reassociateLost(
+    const std::vector<Track>& tracks,
+    const std::vector<int>& free_track_idx,
+    const std::vector<Detection>& dets,
+    const std::vector<cv::Mat>& det_hists,
+    std::vector<int>& track_match,
+    std::vector<int>& det_match) {
+
+    track_match.assign(tracks.size(), -1);
+    det_match.assign(dets.size(), -1);
+    if (free_track_idx.empty() || dets.empty()) return;
+
+    struct Pair { float score; int ti; int di; };
+    std::vector<Pair> pairs;
+
+    for (int ti : free_track_idx) {
+        if (ti < 0 || ti >= (int)tracks.size()) continue;
+        const Track& t = tracks[ti];
+        // time_since_update 在本轮 predict() 后已自增：1 = 本帧刚失配，
+        // 2 及以上 = 已连续失联 (time_since_update-1) 帧。
+        const int lost = std::max(0, t.time_since_update - 1);
+        const float base = std::max(kReidBaseRadiusPx,
+                                    kReidBoxRatio * (float)std::max(t.rect.width,
+                                                                    t.rect.height));
+        const float radius = std::min(kReidMaxRadiusPx,
+                                      base + kReidPerLostPx * (float)lost);
+        const cv::Point2f tc(t.rect.x + t.rect.width * 0.5f,
+                             t.rect.y + t.rect.height * 0.5f);
+
+        for (size_t di = 0; di < dets.size(); di++) {
+            const Detection& d = dets[di];
+            const cv::Point2f dc(d.box.x + d.box.width * 0.5f,
+                                 d.box.y + d.box.height * 0.5f);
+            const float dist = (float)cv::norm(dc - tc);
+            if (dist > radius) continue;
+
+            // 距离评分：窗口内线性衰减（窗口边缘 = 0），窗口本身已按失联帧数放大
+            const float s_dist = std::max(0.0f, 1.0f - dist / radius);
+            const float mahal = t.kf.mahalanobisDistance(d.box);
+            const float s_motion = 1.0f / (1.0f + mahal);                 // (0,1]
+
+            float s_appear = -1.0f;                                       // <0 = 无外观证据
+            if (di < det_hists.size() && !t.appearance_hist.empty() &&
+                !det_hists[di].empty()) {
+                s_appear = std::max(0.0f,
+                    (float)cv::compareHist(t.appearance_hist, det_hists[di],
+                                           cv::HISTCMP_CORREL));
+                if (s_appear < kReidMinAppearance) continue;              // 外观不像，放弃
+            } else if (lost == 0) {
+                continue;   // 无外观证据且本帧才失配 → 不冒险建关联
+            }
+
+            float score = 0.0f;
+            float thresh = kReidScoreThreshNoAppear;
+            if (s_appear >= 0.0f) {
+                score = kReidWDist * s_dist + kReidWMotion * s_motion +
+                        kReidWAppear * s_appear;
+                thresh = kReidScoreThresh;
+            } else {
+                score = 0.5f * s_dist + 0.5f * s_motion;
+            }
+            if (score >= thresh) pairs.push_back({score, ti, (int)di});
+        }
+    }
 
     std::sort(pairs.begin(), pairs.end(),
               [](const Pair& a, const Pair& b) { return a.score > b.score; });
@@ -259,6 +363,42 @@ std::vector<TrackedObject> ByteTrackTracker::update(
     for (size_t k = 0; k < t_match2.size(); k++)
         if (t_match2[k] >= 0) t_matched2[t2_indices[k]] = true;
 
+    // ====== Step 3.5（NEW）: 遮挡重连 — 未匹配 track vs 未匹配高分检测 ======
+    // 抑制遮挡导致的 ID 切换：主通道(iou<0.05 预过滤)在"外推框与真实框不重叠"
+    // 时会直接失配，这里用搜索窗 + 运动/外观做二次关联，把同一个人的检测挂回旧 ID。
+    std::vector<int> t_match3(active_tracks_.size(), -1);   // 值 = det_high 下标
+    std::vector<bool> t_matched3(active_tracks_.size(), false);
+    std::vector<bool> d_matched3(det_high.size(), false);
+    if (!frame.empty() && !det_high.empty()) {
+        std::vector<int> free_tracks;
+        for (size_t i = 0; i < active_tracks_.size(); i++)
+            if (!t_matched1[i] && !t_matched2[i]) free_tracks.push_back((int)i);
+
+        std::vector<int> free_dets;                 // det_high 下标
+        for (size_t j = 0; j < det_high.size(); j++)
+            if (d_match1[j] < 0) free_dets.push_back((int)j);
+
+        if (!free_tracks.empty() && !free_dets.empty()) {
+            std::vector<Detection> fdets;
+            std::vector<cv::Mat> fhists;
+            fdets.reserve(free_dets.size());
+            fhists.reserve(free_dets.size());
+            for (int j : free_dets) {
+                fdets.push_back(det_high[j]);
+                fhists.push_back(det_hists_high[j]);
+            }
+            std::vector<int> tm, dm;
+            reassociateLost(active_tracks_, free_tracks, fdets, fhists, tm, dm);
+            for (size_t k = 0; k < dm.size(); k++) {
+                if (dm[k] < 0) continue;
+                const int ti = dm[k];
+                t_match3[ti] = free_dets[k];
+                t_matched3[ti] = true;
+                d_matched3[free_dets[k]] = true;
+            }
+        }
+    }
+
     // ====== Step 4: 更新匹配上的track（含外观直方图EMA） ======
     for (size_t i = 0; i < active_tracks_.size(); i++) {
         const Detection* det_ptr = nullptr;
@@ -267,6 +407,9 @@ std::vector<TrackedObject> ByteTrackTracker::update(
         if (t_match1[i] >= 0) {
             det_ptr = &det_high[t_match1[i]];
             det_hist = det_hists_high[t_match1[i]];
+        } else if (t_matched3[i]) {
+            det_ptr = &det_high[t_match3[i]];
+            det_hist = det_hists_high[t_match3[i]];
         } else if (t_matched2[i]) {
             for (size_t k = 0; k < t2_indices.size(); k++) {
                 if (t2_indices[k] == (int)i && t_match2[k] >= 0) {
@@ -301,13 +444,13 @@ std::vector<TrackedObject> ByteTrackTracker::update(
     std::vector<Track> new_active;
 
     for (size_t i = 0; i < active_tracks_.size(); i++) {
-        if (t_matched1[i] || t_matched2[i]) {
+        if (t_matched1[i] || t_matched2[i] || t_matched3[i]) {
             new_active.push_back(active_tracks_[i]);
         }
     }
 
     for (size_t i = 0; i < active_tracks_.size(); i++) {
-        if (!t_matched1[i] && !t_matched2[i]) {
+        if (!t_matched1[i] && !t_matched2[i] && !t_matched3[i]) {
             if (active_tracks_[i].time_since_update < max_lost_) {
                 new_active.push_back(active_tracks_[i]);
             }
@@ -315,9 +458,12 @@ std::vector<TrackedObject> ByteTrackTracker::update(
     }
 
     // ====== Step 6: 未匹配的高置信度检测创建新track ======
+    // 注意：只有"主通道 + 低分通道 + 遮挡重连"三路都没匹配上的检测才会新建 ID。
     std::vector<bool> d_used_high(det_high.size(), false);
     for (size_t i = 0; i < d_match1.size(); i++)
         if (d_match1[i] >= 0) d_used_high[i] = true;
+    for (size_t j = 0; j < d_matched3.size(); j++)
+        if (d_matched3[j]) d_used_high[j] = true;
 
     for (size_t j = 0; j < det_high.size(); j++) {
         if (!d_used_high[j]) {

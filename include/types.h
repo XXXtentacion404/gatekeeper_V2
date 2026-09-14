@@ -118,10 +118,10 @@ struct CameraConfigEntry {
     int width;
     int height;
     std::vector<std::vector<cv::Point>> detection_zones;
-    Tripwire entry_line;        // 入口绊线 (t1)
-    Tripwire exit_line;         // 出口绊线 (t2)
-    float entry_zone_depth = 0; // 入口区域深度(px), 0=旧版线模式
-    float exit_zone_depth = 0;  // 出口区域深度(px)
+    // 入口绊线 (t1)：作为"入口带"基准线，向检测区内延伸 |entry_zone_depth| px。
+    // 出口区域已删除：检测区域之外一律视为出口（main_tracking 的 R0）。
+    Tripwire entry_line;
+    float entry_zone_depth = 0; // 入口区域深度(px，符号决定延伸方向)，<1 = 无入口带
 };
 
 // 日志宏

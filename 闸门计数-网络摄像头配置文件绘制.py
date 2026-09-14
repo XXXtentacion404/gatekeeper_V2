@@ -34,6 +34,8 @@ ip_lock = threading.Lock()
 class Communicate(QObject):
     update_log = pyqtSignal(str)
     set_board_ip = pyqtSignal(str)
+    probe_done = pyqtSignal()             # 探测结束（子线程不能直接碰控件，必须走信号回落 GUI 线程）
+    upload_done = pyqtSignal(bool, str)   # 上传+停止结束(成功?, 错误信息)
 
 def get_network_prefixes():
     """获取本机所有网卡网段"""
@@ -116,8 +118,54 @@ def probe_network(prefix, log_signal):
     udp.close()
 
 
+def _ssh_run(ssh, cmd, log_signal, timeout=8):
+    """执行一条远程命令，返回 (退出码, 全部输出)。
+    必须 read() + recv_exit_status()，否则命令是否成功、报了什么错都看不到。"""
+    try:
+        _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+        out = stdout.read().decode("utf-8", "ignore").strip()
+        err = stderr.read().decode("utf-8", "ignore").strip()
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            log_signal.emit(f"  $ {cmd}\n    {out}")
+        if err:
+            log_signal.emit(f"  $ {cmd}  [stderr] {err}")
+        return rc, (out + "\n" + err)
+    except Exception as e:
+        log_signal.emit(f"  $ {cmd}  执行异常: {e}")
+        return -1, str(e)
+
+
+def stop_remote_programs(ssh, log_signal):
+    """停止板端 main_tracking / video_debug，并**验证**是否真的停了。
+
+    为什么不用 sudo：SSH 非交互通道没有 tty，`sudo pkill ...` 会直接报
+    "no tty present and no askpass program specified" 并失败——这正是
+    "更新到设备后，板端程序还在跑"的根因。topeet 用户杀掉自己启的进程不需要 sudo。
+
+    为什么还要验证：板端常见 `while true; do ./main_tracking; done` 或 rc.local/systemd
+    之类守护，杀了会立刻被拉起来。这里用 pgrep 复查并把存活进程+排查线索写进日志，
+    而不是假装成功了。
+    """
+    log_signal.emit("停止板端程序...")
+    _ssh_run(ssh, "pkill -9 -f main_tracking", log_signal)
+    _ssh_run(ssh, "pkill -9 -f video_debug", log_signal)
+    time.sleep(1.0)
+    _, left = _ssh_run(ssh, "pgrep -af 'main_tracking|video_debug' || true", log_signal)
+    alive = [ln for ln in left.splitlines() if ln.strip()]
+    if alive:
+        log_signal.emit("⚠ 停止后仍有进程存活 —— 板端很可能有自启动/守护脚本在拉活：")
+        for ln in alive:
+            log_signal.emit(f"    {ln}")
+        log_signal.emit("  排查: ps -ef | grep -v grep | grep -E 'main_tracking|video_debug'")
+        log_signal.emit("  看这些进程的 PPID 是谁（while 循环 / rc.local / systemd），停掉对应的守护即可")
+        return False
+    log_signal.emit("已确认板端程序全部停止")
+    return True
+
+
 def scp_send(local_path, remote_ip, log_signal):
-    """SCP发送文件到设备（30秒超时保护）"""
+    """SCP发送文件到设备（45秒超时保护）+ 停止板端旧程序"""
     result = [False, ""]
     done = threading.Event()
     def _upload():
@@ -131,10 +179,8 @@ def scp_send(local_path, remote_ip, log_signal):
             scp = SCPClient(ssh.get_transport(), socket_timeout=10)
             scp.put(local_path, f"{REMOTE_DIR}/")
             scp.close()
-            log_signal.emit("终止旧进程...")
-            ssh.exec_command("sudo pkill -9 -f main_tracking", timeout=5)
-            ssh.exec_command("sudo pkill -9 -f video_debug", timeout=5)
-            result[0] = True
+            log_signal.emit("上传完成")
+            result[0] = stop_remote_programs(ssh, log_signal)
         except Exception as e:
             result[1] = str(e)
         finally:
@@ -143,8 +189,8 @@ def scp_send(local_path, remote_ip, log_signal):
         done.set()
     t = threading.Thread(target=_upload, daemon=True)
     t.start()
-    if not done.wait(30):
-        log_signal.emit("上传超时(30秒)")
+    if not done.wait(45):
+        log_signal.emit("上传超时(45秒)")
         return False, "上传超时"
     return result[0], result[1]
 
@@ -193,10 +239,32 @@ def _rect_to_line_depth(zone):
 
 
 # ==================== 多边形绘制 ====================
-# 入/出标记区域深度（px）：标记线向检测区内延伸 100px 为入标记区域，
-# 向检测区外延伸 50px 为出标记区域。
+# 入口带深度（px）：入口绊线(t1)向检测区内延伸这么多像素 = C++ 端的 R1 区域。
+# 出口区域已删除（req4）：检测区域多边形之外一律视为出口(R0)，配置文件不再写 t2。
 ENTRY_MARKER_DEPTH = 100
-EXIT_MARKER_DEPTH = 50
+
+
+def _depth_toward_detection(polys, p1, p2, depth=ENTRY_MARKER_DEPTH):
+    """判断绊线 p1->p2 的哪一侧朝向检测区中心，返回**带符号**深度。
+
+    右手系法向 u = (dy, -dx)/L 与 C++ inwardNormal 完全一致；depth>0 表示入口带
+    朝 u 方向延伸。旧配置文件的 t1 只有 4 个参数（没有深度），若当成 depth=0，
+    入口带会退化成一条线，保存时又会把板端 R1 区域抹掉，所以这里按检测区中心
+    自动定向补一个默认深度。
+    """
+    dx = p2[1] - p1[1]
+    dy = -(p2[0] - p1[0])
+    L = (dx*dx + dy*dy) ** 0.5
+    if L < 1:
+        return depth
+    ux, uy = dx/L, dy/L
+    pts = [pt for poly in polys if len(poly) >= 3 for pt in poly]
+    if not pts:
+        return depth
+    cx = sum(x for x, y in pts) / len(pts)
+    cy = sum(y for x, y in pts) / len(pts)
+    dot = (cx - p1[0]) * ux + (cy - p1[1]) * uy
+    return depth if dot >= 0 else -depth
 
 
 class PolygonDrawer(QWidget):
@@ -207,10 +275,10 @@ class PolygonDrawer(QWidget):
         super().__init__()
         self.current = []         # 绘制中: [p1_disp, p2_disp]
         self.polygons = []
-        # 4 点矩形: [(p1),(p2),(p3),(p4)]  p1->p2 标记线(外侧边), p3->p4 内侧边
-        self.entry_zone = None    # 入标记区域（标记线向检测区内 ENTRY_MARKER_DEPTH）
-        self.exit_zone = None     # 出标记区域（标记线向检测区外 EXIT_MARKER_DEPTH）
-        self.marker_line = None   # 标记线 [p1, p2]（图像坐标）
+        # 4 点矩形: [(p1),(p2),(p3),(p4)]  p1->p2 绊线(外侧边), p3->p4 内侧边
+        self.entry_zone = None    # 入口带（t1 向检测区内 ENTRY_MARKER_DEPTH）
+        self.exit_zone = None     # 出口区域已删除（检测区外即出口），保留字段仅为兼容
+        self.marker_line = None   # 入口绊线 [p1, p2]（图像坐标）
         self.mode = self.MODE_POLYGON
         self.drawing = False
         self.frame = None
@@ -238,12 +306,11 @@ class PolygonDrawer(QWidget):
     def _clamp(self, p):
         return QPoint(max(self.ox,min(p.x(),self.ox+self.dw)), max(self.oy,min(p.y(),self.oy+self.dh)))
 
-    # ---- 标记线 -> 入/出标记区域 ----
+    # ---- 入口绊线 -> 入口带 ----
     def _compute_marker_zones(self, p1, p2):
-        """由标记线 [p1,p2] 和检测区域多边形，自动计算入/出标记区域。
-        入标记区域 = 标记线向检测区内延伸 ENTRY_MARKER_DEPTH px
-        出标记区域 = 标记线向检测区外延伸 EXIT_MARKER_DEPTH px
-        入侧方向 = 指向检测区域多边形中心的方向。"""
+        """由入口绊线 [p1,p2] 和检测区域多边形，自动计算入口带。
+        入口带 = 绊线向检测区内延伸 ENTRY_MARKER_DEPTH px（C++ 端 R1 区域）。
+        出口区域已删除：检测区域多边形之外一律视为出口(R0)。"""
         dx = p2[1] - p1[1]
         dy = -(p2[0] - p1[0])
         L = (dx*dx + dy*dy) ** 0.5
@@ -263,13 +330,11 @@ class PolygonDrawer(QWidget):
         entry = [p1, p2,
                  (int(round(p1[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p1[1] + uy*ENTRY_MARKER_DEPTH))),
                  (int(round(p2[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p2[1] + uy*ENTRY_MARKER_DEPTH)))]
-        exit_ = [p1, p2,
-                 (int(round(p1[0] - ux*EXIT_MARKER_DEPTH)), int(round(p1[1] - uy*EXIT_MARKER_DEPTH))),
-                 (int(round(p2[0] - ux*EXIT_MARKER_DEPTH)), int(round(p2[1] - uy*EXIT_MARKER_DEPTH)))]
-        return entry, exit_
+        return entry, None
 
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton: return
+        if self.frame is None or self.dw <= 0 or self.dh <= 0: return   # 没有画面就没有坐标系，别画
         p = self._clamp(e.pos())
         if self.mode == self.MODE_MARKER_LINE:
             # 标记线: 两次点击分别确定 p1 / p2
@@ -304,6 +369,9 @@ class PolygonDrawer(QWidget):
             l = self.current[-1]
             if abs(l.x()-p.x())>5 or abs(l.y()-p.y())>5: self.current.append(p)
             self.polygons.append([self._to(pt) for pt in self.current])
+            # 收尾必须复位：否则 paintEvent 会把刚完成的区域当成"绘制中"再描一遍绿线
+            self.current = []
+            self.drawing = False
         self.update()
 
     def _finish_marker_line(self):
@@ -317,8 +385,9 @@ class PolygonDrawer(QWidget):
         self.update()
 
     def paintEvent(self, e):
+        if self.frame is None or self.dw <= 0 or self.dh <= 0:
+            return   # 没有画面 / 控件还没布局好：此时 cv2.resize((0,0)) 会直接抛异常
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
-        if self.frame is None: return
         s = cv2.resize(self.frame, (self.dw, self.dh), interpolation=cv2.INTER_AREA)
         h, w = s.shape[:2]
         qi = QImage(s.data, w, h, 3*w, QImage.Format_RGB888).rgbSwapped()
@@ -334,13 +403,12 @@ class PolygonDrawer(QWidget):
             for poly in self.polygons:
                 p.drawPolygon(QPolygon([self._td(x,y) for x,y in poly]))
 
-        # 入标记区域 (绿) + 出标记区域 (红)
-        # 存储顺序: zone = [p1, p2, p3, p4]  p1->p2 标记线(外侧边), p3->p4 内侧边
+        # 入口带 (绿)；出口区域已删除
+        # 存储顺序: zone = [p1, p2, p3, p4]  p1->p2 绊线(外侧边), p3->p4 内侧边
         # 矩形顶点绘制顺序必须为 p1 -> p2 -> p4 -> p3 (顺时针或逆时针), 不能 p1->p2->p3->p4
         # 否则 Qt drawPolygon 会画成 2 个三角形
         for zone, fill, col, label in [
-            (self.entry_zone, QColor(0,255,0,50), QColor(0,160,0), "入标记区域"),
-            (self.exit_zone,  QColor(255,0,0,50), QColor(160,0,0), "出标记区域"),
+            (self.entry_zone, QColor(0,255,0,50), QColor(0,160,0), "入口带"),
         ]:
             if zone and len(zone) == 4:
                 # 顶点顺序: p1, p2, p4, p3 (跳过 p3 到 p4 的对角)
@@ -386,16 +454,31 @@ class PolygonDrawer(QWidget):
     def delete_last(self):
         if self.polygons: self.polygons.pop(); self.update()
     def set_polygons(self, ps, ow, oh):
-        sx = self.ow/ow if ow>0 else 1; sy = self.oh/oh if oh>0 else 1
+        # 画面还没加载时 self.ow/oh 为 0，无法把配置坐标换算到画面坐标；
+        # 强行算会得到 scale=0 把所有点压到 (0,0)。交给后面加载画面时再应用。
+        if not self.ow or not self.oh or ow <= 0 or oh <= 0: return
+        sx, sy = self.ow/ow, self.oh/oh
         self.polygons = [[(int(x*sx),int(y*sy)) for x,y in p] for p in ps]; self.update()
     def set_zones(self, entry_zone, exit_zone, ow, oh):
         """设置 4 点矩形 (来自配置)，并据此重建标记线"""
-        sx = self.ow/ow if ow>0 else 1; sy = self.oh/oh if oh>0 else 1
+        if not self.ow or not self.oh or ow <= 0 or oh <= 0: return
+        sx, sy = self.ow/ow, self.oh/oh
         if entry_zone and len(entry_zone) == 4:
             self.entry_zone = [(int(x*sx),int(y*sy)) for x,y in entry_zone]
             self.marker_line = [self.entry_zone[0], self.entry_zone[1]]
         if exit_zone and len(exit_zone) == 4:
             self.exit_zone = [(int(x*sx),int(y*sy)) for x,y in exit_zone]
+        self.update()
+    def rebase(self, ow_old, oh_old, ow_new, oh_new):
+        """把一个图像坐标空间里的图形整体换算到另一个空间（分辨率变化时用）。
+        不做这一步的话，旧坐标会被当作新空间的坐标使用 → 多边形/入口带整体错位。"""
+        if not (ow_old and oh_old and ow_new and oh_new): return
+        sx, sy = ow_new/ow_old, oh_new/oh_old
+        def f(p): return (int(round(p[0]*sx)), int(round(p[1]*sy)))
+        self.polygons = [[f(pt) for pt in poly] for poly in self.polygons]
+        if self.entry_zone:  self.entry_zone  = [f(pt) for pt in self.entry_zone]
+        if self.exit_zone:   self.exit_zone   = [f(pt) for pt in self.exit_zone]
+        if self.marker_line: self.marker_line = [f(pt) for pt in self.marker_line]
         self.update()
 
 
@@ -428,9 +511,13 @@ class MainWindow(QMainWindow):
         self.cfg_path = None; self.cams = []; self.cam_i = -1
         self.cap = None; self.timer = QTimer(self); self.timer.timeout.connect(self._upd)
         self.cam_thread = None
+        self._dead_threads = []      # 仍在收尾的 RTSP 线程，保留引用避免被 GC 掉导致崩溃
+        self._suppress_res = False   # 程序化改分辨率时抑制 rebase
         self.comm = Communicate()
         self.comm.update_log.connect(self._log)
         self.comm.set_board_ip.connect(self._set_ip)
+        self.comm.probe_done.connect(self._probe_done)
+        self.comm.upload_done.connect(self._upload_done)
         self._ui()
         self._log("gatekeeper_V4 启动就绪")
 
@@ -461,7 +548,10 @@ class MainWindow(QMainWindow):
         b = QPushButton("选文件"); b.clicked.connect(self._sel_file); r2.addWidget(b)
         r2.addWidget(self.file_ed); bl.addLayout(r2)
 
-        b = QPushButton("更新到设备"); b.clicked.connect(self._upload); bl.addWidget(b)
+        rb = QHBoxLayout()
+        b = QPushButton("更新到设备"); b.clicked.connect(self._upload); rb.addWidget(b)
+        b = QPushButton("停止设备程序"); b.clicked.connect(self._stop_remote); rb.addWidget(b)
+        bl.addLayout(rb)
 
         self.log_text = QTextEdit(); self.log_text.setReadOnly(True); self.log_text.setMinimumHeight(100)
         bl.addWidget(QLabel("日志:")); bl.addWidget(self.log_text)
@@ -486,6 +576,8 @@ class MainWindow(QMainWindow):
         for t, ed in [("IP:",self.ip_ed),("用户:",self.user_ed),("密码:",self.pass_ed),("通道:",self.ch_ed)]:
             r = QHBoxLayout(); r.addWidget(QLabel(t)); r.addWidget(ed); il.addLayout(r)
         r = QHBoxLayout(); r.addWidget(QLabel("分辨率:")); r.addWidget(self.res_cb); il.addLayout(r)
+        # 改分辨率会改变绘制坐标系，必须同步换算已有图形，否则多边形/入口带会整体错位
+        self.res_cb.currentTextChanged.connect(self._res_changed)
         ig.setLayout(il); cl.addWidget(ig)
 
         # ---- 绘制 ----
@@ -504,7 +596,7 @@ class MainWindow(QMainWindow):
         pl.addLayout(r)
 
         pl.addWidget(QLabel("步骤: 1)先画检测区域(多边形)  2)在区域边界点2点=标记线"))
-        pl.addWidget(QLabel("自动: 入标记区域=向区域内100px | 出标记区域=向区域外50px"))
+        pl.addWidget(QLabel("自动: 入口带 = 标记线向检测区内延伸100px（出口区域已删，检测区外即出口）"))
         b = QPushButton("保存当前"); b.clicked.connect(self._save_cur); pl.addWidget(b)
         pg.setLayout(pl); cl.addWidget(pg)
         cl.addStretch()
@@ -519,35 +611,74 @@ class MainWindow(QMainWindow):
         with ip_lock: found_ip = None
         self.board_ip_edit.setEnabled(True); self.probe_btn.setEnabled(False)
         def run():
+            # 子线程里绝不能直接调 self._log / setEnabled 这类操作控件的方法；
+            # 一律通过信号回到 GUI 线程，否则会出现界面卡住、显示错乱甚至崩溃。
             for ni in get_network_prefixes():
                 with ip_lock:
                     if found_ip: break
-                self._log(f"扫描 {ni['prefix']}0/24")
+                self.comm.update_log.emit(f"扫描 {ni['prefix']}0/24")
                 probe_network(ni['prefix'], self.comm.update_log)
             with ip_lock:
                 if found_ip:
                     self.comm.set_board_ip.emit(found_ip)
-                    self._log(f"完成: {found_ip}")
-                else: self._log("未找到设备")
-            self.probe_btn.setEnabled(True)
+                    self.comm.update_log.emit(f"完成: {found_ip}")
+                else:
+                    self.comm.update_log.emit("未找到设备")
+            self.comm.probe_done.emit()
         threading.Thread(target=run, daemon=True).start()
+
+    def _probe_done(self):
+        self.probe_btn.setEnabled(True)
 
     def _sel_file(self):
         p, _ = QFileDialog.getOpenFileName(self, "选文件", "", "All(*.*)")
         if p: self.file_ed.setText(p)
+
+    def _ask_pw(self):
+        pw, ok = QInputDialog.getText(self,"密码","更新密码:", QLineEdit.Password)
+        if not ok or pw != "topeet":
+            QMessageBox.warning(self,"err","密码错"); return False
+        return True
 
     def _upload(self):
         ip = self.board_ip_edit.text().strip()
         fp = self.file_ed.text().strip() or self.cfg_path or ""
         if not ip: QMessageBox.warning(self,"err","无设备IP"); return
         if not fp: QMessageBox.warning(self,"err","无文件"); return
-        pw, ok = QInputDialog.getText(self,"密码","更新密码:", QLineEdit.Password)
-        if not ok or pw != "topeet": QMessageBox.warning(self,"err","密码错"); return
+        if not self._ask_pw(): return
         self._log(f"上传 {fp}")
         def run():
             ok2, err = scp_send(fp, ip, self.comm.update_log)
-            if ok2: self.comm.update_log.emit("上传成功"); QMessageBox.information(self,"ok","上传成功")
-            else: self.comm.update_log.emit(f"失败:{err}"); QMessageBox.warning(self,"err",err)
+            # QMessageBox 只能在 GUI 线程弹；子线程直接弹会卡死/异常，所以走信号。
+            self.comm.upload_done.emit(ok2, err or "")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _upload_done(self, ok, err):
+        if ok:
+            self._log("上传并停止板端程序成功")
+            QMessageBox.information(self, "ok",
+                "上传成功，板端旧程序已停止。\n\n请到板子上用新配置重新启动。")
+        else:
+            self._log(f"失败: {err}")
+            QMessageBox.warning(self, "err", err or "上传失败（详见日志）")
+
+    def _stop_remote(self):
+        """只停止板端程序（不传文件）：用于排查「杀了又自己起来」的自启动/守护脚本。"""
+        ip = self.board_ip_edit.text().strip()
+        if not ip: QMessageBox.warning(self,"err","无设备IP"); return
+        if not self._ask_pw(): return
+        def run():
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                ssh.connect(ip, 22, SSH_USER, SSH_PASS, timeout=6, banner_timeout=5, auth_timeout=5)
+                stop_remote_programs(ssh, self.comm.update_log)
+            except Exception as e:
+                self.comm.update_log.emit(f"连接失败: {e}")
+            finally:
+                try: ssh.close()
+                except: pass
         threading.Thread(target=run, daemon=True).start()
 
     # ==== 配置解析 ====
@@ -566,71 +697,48 @@ class MainWindow(QMainWindow):
                     res="1920*1080"; rest=ps[4:] if len(ps)>4 else []
                     if rest and '*' in rest[0]: res=rest[0]; rest=rest[1:]
                     
-                    polys=[]; entry=None; exit=None
-                    for token in rest:
-                        if token.startswith('t1,'):
-                            parts=token[3:].replace(',',' ').split()
-                            # 标记线 5 参: t1,x1,y1,x2,y2,depth
-                            # depth 符号表入侧方向, |depth|=入标记区域深度
-                            if len(parts) >= 5:
-                                d = int(parts[4])
-                                p1 = (int(parts[0]), int(parts[1]))
-                                p2 = (int(parts[2]), int(parts[3]))
-                                p3, p4 = _rect_from_line_depth(p1, p2, d)
-                                entry = [p1, p2, p3, p4]
-                                # 出标记区域 = 标记线向检测区外(反方向)延伸 EXIT_MARKER_DEPTH
-                                exit_d = EXIT_MARKER_DEPTH if d < 0 else -EXIT_MARKER_DEPTH
-                                e3, e4 = _rect_from_line_depth(p1, p2, exit_d)
-                                exit = [p1, p2, e3, e4]
-                            elif len(parts) >= 4:
-                                p1 = (int(parts[0]), int(parts[1]))
-                                p2 = (int(parts[2]), int(parts[3]))
-                                entry = [p1, p2, p1, p2]
-                        elif token.startswith('t2,'):
-                            parts=token[3:].replace(',',' ').split()
-                            if len(parts) >= 5:
-                                d = int(parts[4])
-                                p1 = (int(parts[0]), int(parts[1]))
-                                p2 = (int(parts[2]), int(parts[3]))
-                                p3, p4 = _rect_from_line_depth(p1, p2, d)
-                                exit = [p1, p2, p3, p4]
-                            elif len(parts) >= 4:
-                                p1 = (int(parts[0]), int(parts[1]))
-                                p2 = (int(parts[2]), int(parts[3]))
-                                exit = [p1, p2, p1, p2]
-                        elif token.startswith('['):
-                            pts=[]
-                            pstr=token[1:].rstrip(']')
-                            # handle multi-token polygon
-                            if ']' not in token:
-                                # accumulate
-                                pass
-                            for pt_str in pstr.split():
-                                if ',' in pt_str:
-                                    xs,ys=pt_str.split(',')
-                                    pts.append((int(xs),int(ys)))
-                            if len(pts)>=3: polys.append(pts)
-
-                    # handle multi-token polygons (re-parse properly)
-                    pstr=' '.join(rest)
-                    polys2=[]
-                    start=0
+                    # 1) 先解析检测区多边形（入口带定向需要检测区中心）
+                    pstr = ' '.join(rest)
+                    polys = []
+                    start = 0
                     while True:
-                        a=pstr.find('[',start)
-                        if a==-1: break
-                        b=pstr.find(']',a)
-                        if b==-1: break
-                        pts=[]
+                        a = pstr.find('[', start)
+                        if a == -1: break
+                        b = pstr.find(']', a)
+                        if b == -1: break
+                        pts = []
                         for ps2 in pstr[a+1:b].split():
                             if ',' in ps2:
-                                x,y=map(int,ps2.split(','))
-                                pts.append((x,y))
-                        if len(pts)>=3: polys2.append(pts)
-                        start=b+1
+                                x, y = map(int, ps2.split(','))
+                                pts.append((x, y))
+                        if len(pts) >= 3: polys.append(pts)
+                        start = b + 1
+
+                    # 2) 再解析入口绊线 t1（5 参: t1,x1,y1,x2,y2,depth，depth 符号=入口带方向）
+                    entry = None
+                    for token in rest:
+                        if token.startswith('t1,'):
+                            parts = token[3:].replace(',', ' ').split()
+                            if len(parts) < 4: continue
+                            p1 = (int(parts[0]), int(parts[1]))
+                            p2 = (int(parts[2]), int(parts[3]))
+                            if len(parts) >= 5 and int(parts[4]) != 0:
+                                depth = int(parts[4])
+                            else:
+                                # 旧格式 t1 只有 4 个参数（无深度）。若当成 depth=0，入口带会
+                                # 退化成一条线，保存时还会把板端 R1 区域抹掉 —— 按检测区中心
+                                # 方向补一个默认深度。
+                                depth = _depth_toward_detection(polys, p1, p2)
+                                self._log(f"t1 无深度，已按检测区方向补 {depth:+d}px")
+                            p3, p4 = _rect_from_line_depth(p1, p2, depth)
+                            entry = [p1, p2, p3, p4]
+                        elif token.startswith('t2,'):
+                            # 出口绊线已废弃：检测区域之外即出口，解析但忽略
+                            self._log(f"忽略已废弃的出口绊线 t2: {token}")
 
                     self.cams.append({'ip':ip,'username':u,'password':pwd,'channel':ch,
-                                      'resolution':res,'polygons':polys2,
-                                      'entry_zone':entry,'exit_zone':exit})
+                                      'resolution':res,'polygons':polys,
+                                      'entry_zone':entry,'exit_zone':None})
         except Exception as e: QMessageBox.warning(self,"err",str(e)); return
         self.cam_lst.clear()
         for c in self.cams: self.cam_lst.addItem(f"{c['ip']}(Ch{c['channel']})")
@@ -639,14 +747,42 @@ class MainWindow(QMainWindow):
     def _sel_cam(self, item):
         i=self.cam_lst.row(item)
         if i<0: return
+        # 重复点同一个摄像头时不要清画布：否则刚画好、还没保存的区域/标记线会被悄悄清掉
+        keep = (i == self.cam_i) and (self.drawer.polygons or self.drawer.marker_line)
         self.cam_i=i; c=self.cams[i]
         self.ip_ed.setText(c['ip']); self.user_ed.setText(c['username'])
         self.pass_ed.setText(c['password']); self.ch_ed.setText(c['channel'])
-        self.res_cb.setCurrentText(c['resolution']); self.drawer.clear()
-        if self.drawer.frame is not None:
-            w,h=map(int,c['resolution'].split('*'))
-            self.drawer.set_polygons(c['polygons'],w,h)
-            self.drawer.set_zones(c.get('entry_zone'),c.get('exit_zone'),w,h)
+        self._suppress_res = True          # 程序化改分辨率：不要触发坐标换算
+        self.res_cb.setCurrentText(c['resolution'])
+        self._suppress_res = False
+        if not keep:
+            self.drawer.clear()
+        self._apply_saved_geometry()
+
+    def _apply_saved_geometry(self):
+        """把当前配置里的多边形/入口带加载进画布。
+        画布已有内容时不覆盖 —— 否则用户刚画好的区域/标记线会被悄悄清掉。"""
+        if not (0 <= self.cam_i < len(self.cams)): return
+        d = self.drawer
+        if d.frame is None or d.polygons or d.marker_line: return
+        c = self.cams[self.cam_i]
+        try: w, h = map(int, c['resolution'].split('*'))
+        except Exception: return
+        d.set_polygons(c['polygons'], w, h)
+        d.set_zones(c.get('entry_zone'), c.get('exit_zone'), w, h)
+
+    def _res_changed(self, text):
+        """分辨率下拉改变 → 绘制坐标空间随之改变，把已有图形按比例换算过去，
+        否则旧坐标被当成新空间坐标 → 多边形/入口带整体错位（显示 bug）。"""
+        if self._suppress_res: return
+        try: nw, nh = map(int, text.split('*'))
+        except Exception: return
+        ow, oh = self.drawer.ow, self.drawer.oh
+        if not (ow and oh): return
+        if (ow, oh) != (nw, nh):
+            self.drawer.rebase(ow, oh, nw, nh)
+        if 0 <= self.cam_i < len(self.cams):
+            self.cams[self.cam_i]['resolution'] = text
 
     def _cam(self):
         if self.cam_i<0: QMessageBox.warning(self,"err","先选摄像头"); return
@@ -661,11 +797,8 @@ class MainWindow(QMainWindow):
 
     def _cam_ok(self, cap, ip):
         self.cap=cap; self.timer.start(30); self._log(f"已连接 {ip}")
-        # 摄像头连接后加载一次当前配置中的多边形和绊线
-        if 0<=self.cam_i<len(self.cams):
-            c=self.cams[self.cam_i]; w,h=map(int,c['resolution'].split('*'))
-            self.drawer.set_polygons(c['polygons'],w,h)
-            self.drawer.set_zones(c.get('entry_zone'),c.get('exit_zone'),w,h)
+        # 摄像头连接后加载一次当前配置中的多边形和绊线（画布已有内容则不覆盖）
+        self._apply_saved_geometry()
 
     def _cam_fail(self, msg): self._log(f"连接失败:{msg}")
 
@@ -673,7 +806,12 @@ class MainWindow(QMainWindow):
         if self.timer.isActive(): self.timer.stop()
         if self.cap: self.cap.release(); self.cap=None
         if self.cam_thread and self.cam_thread.isRunning():
-            self.cam_thread.quit(); self.cam_thread.wait(1000)
+            self.cam_thread.quit()
+            if not self.cam_thread.wait(3000):
+                # 线程还卡在 rtsp 打开里。QThread 不能强杀，保留引用让它在后台自然结束；
+                # 被 GC 回收一个仍在运行的 QThread 会直接崩溃。
+                self._dead_threads.append(self.cam_thread)
+        self.cam_thread = None
 
     def _img(self):
         p,_=QFileDialog.getOpenFileName(self,"图片","","Images(*.png *.jpg *.bmp)")
@@ -681,10 +819,7 @@ class MainWindow(QMainWindow):
         f=cv2.imread(p)
         if f is not None:
             self.drawer.set_frame(f)
-            if 0<=self.cam_i<len(self.cams):
-                c=self.cams[self.cam_i]; w,h=map(int,c['resolution'].split('*'))
-                self.drawer.set_polygons(c['polygons'],w,h)
-                self.drawer.set_zones(c.get('entry_zone'),c.get('exit_zone'),w,h)
+            self._apply_saved_geometry()
             self._log(f"已加载: {os.path.basename(p)}")
 
     def _upd(self):
@@ -716,12 +851,17 @@ class MainWindow(QMainWindow):
                     xs = [pt[0] for pt in poly]; ys = [pt[1] for pt in poly]
                     if max(xs)==0 and max(ys)==0: continue
                     lp.append('['+' '.join(f"{x},{y}" for x,y in poly)+']')
-                # 标记线 4 点(入标记区域) -> 换算成 5 参格式 (标记线 + 带符号入深度)
-                # 出标记区域(50px) 由 C++ 端按入深度反方向固定延伸，无需单独存储。
-                if c.get('entry_zone') and len(c['entry_zone']) == 4:
-                    line, depth = _rect_to_line_depth(c['entry_zone'])
-                    if line:
+                # 入口绊线 4 点(入口带) -> 换算成 5 参格式 (绊线 + 带符号深度)
+                # 出口区域已删除：检测区域之外即出口，不再存储 t2。
+                ez = c.get('entry_zone')
+                if ez and len(ez) == 4:
+                    line, depth = _rect_to_line_depth(ez)
+                    if line and abs(depth) >= 1:
                         lp.append(f"t1,{line[0][0]},{line[0][1]},{line[1][0]},{line[1][1]},{depth}")
+                    elif line:
+                        # depth≈0 表示入口带退化成一条线。写出去等于告诉板端"没有入口带"，
+                        # 会把 R1 区域悄悄删掉，所以宁可跳过并提示。
+                        self._log("警告: 入口带深度≈0，已跳过 t1（避免板端 R1 区域消失）")
                 f.write(' '.join(lp)+'\n')
         QMessageBox.information(self,"ok",f"已保存: {p}"); self.cfg_path=p
 

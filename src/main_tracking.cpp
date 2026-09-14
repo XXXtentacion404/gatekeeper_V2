@@ -1,4 +1,4 @@
-﻿/**
+/**
  * gatekeeper_V4 - 主程序
  * YOLOv8检测 -> ByteTrack决策级融合跟踪 -> 区域人数统计 + 虚拟跨线IN/RETRO逆行检测(默认开)
  * 双海康摄像头 RTSP 实时流
@@ -84,11 +84,9 @@ struct CameraConfig {
     cv::Mat detection_mask;
     cv::Mat mask_overlay;
     
-    // 标记线区域（单向闸机：单标记线 + 出入标记区域）
-    Tripwire entry_line;             // 进出标记线（config 里 t1）
-    Tripwire exit_line;              // 保留字段（新逻辑不使用）
-    float entry_zone_depth = 100.0f; // 入标记区域深度(px)：标记线向检测区内延伸
-    float exit_zone_depth = 50.0f;   // 出标记区域深度(px)：标记线向检测区外延伸
+    // 标记线区域（多区域状态机：区域外 → 入口带 → 检测区）
+    Tripwire entry_line;             // 入口绊线（config 里 t1），入口带基准线
+    float entry_zone_depth = 100.0f; // 入口带深度(px)：t1 向检测区内延伸；<1 = 无入口带
     int role = 0;                    // 0=入口摄像头(201) 1=出口摄像头(200)
     std::atomic<int> in_count{0};    // 进入累计
     std::atomic<int> out_count{0};   // 离开累计
@@ -122,8 +120,8 @@ struct CameraConfig {
           frame_counter(o.frame_counter.load()), last_stat_time(o.last_stat_time),
           fps(o.fps), detection_mask(std::move(o.detection_mask)),
           mask_overlay(std::move(o.mask_overlay)),
-          entry_line(o.entry_line), exit_line(o.exit_line),
-          entry_zone_depth(o.entry_zone_depth), exit_zone_depth(o.exit_zone_depth),
+          entry_line(o.entry_line),
+          entry_zone_depth(o.entry_zone_depth),
           role(o.role),
           in_count(o.in_count.load()), out_count(o.out_count.load()),
           retro_count(o.retro_count.load()),
@@ -208,10 +206,7 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
         cc.ip = c.ip; cc.username = c.username; cc.password = c.password; cc.channel = c.channel;
         cc.detection_mask = createDetectionMask(c.width, c.height, c.detection_zones);
         cc.entry_line = c.entry_line;
-        cc.exit_line = c.exit_line;
-        cc.entry_zone_depth = c.entry_zone_depth;  // 入标记区域深度(带符号表入侧方向)
-        cc.exit_zone_depth = c.exit_zone_depth;    // 出标记区域深度
-        if (cc.exit_zone_depth < 1.0f) cc.exit_zone_depth = 50.0f;  // 出标记区域默认50px
+        cc.entry_zone_depth = c.entry_zone_depth;  // 入口带深度(带符号表延伸方向)
         if (!cc.detection_mask.empty()) {
             std::vector<std::vector<cv::Point>> ct;
             cv::findContours(cc.detection_mask, ct, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -233,6 +228,10 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
 }
 
 // ==================== 绘制 ====================
+// 框上 "P<id>" 标签的字号/线宽（看不清就只调这两个数）
+static const double kIdLabelScale     = 1.30;   // 原 0.70
+static const int    kIdLabelThickness = 3;      // 原 2
+
 void draw(cv::Mat& img,
           const std::vector<Detection>& det,
           const std::vector<TrackedObject>& trk,
@@ -247,11 +246,13 @@ void draw(cv::Mat& img,
         if (s.area() <= 0) continue;
         cv::rectangle(img, t.box, t.color, 3);
         std::string lb = "P" + std::to_string(t.track_id);
-        int bl; cv::Size ts = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &bl);
-        cv::rectangle(img, cv::Point(t.box.x, t.box.y-ts.height-4),
-                      cv::Point(t.box.x+ts.width, t.box.y), t.color, cv::FILLED);
-        cv::putText(img, lb, cv::Point(t.box.x, t.box.y-4),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255,255,255), 2);
+        int bl; cv::Size ts = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, kIdLabelScale, kIdLabelThickness, &bl);
+        int ty = t.box.y - 4;                       // 文字基线（默认画在框上方）
+        if (ty < ts.height + 6) ty = ts.height + 6;  // 贴到画面顶边时下移，避免被裁掉
+        cv::rectangle(img, cv::Point(t.box.x, ty-ts.height-4),
+                      cv::Point(t.box.x+ts.width, ty), t.color, cv::FILLED);
+        cv::putText(img, lb, cv::Point(t.box.x, ty),
+                    cv::FONT_HERSHEY_SIMPLEX, kIdLabelScale, cv::Scalar(255,255,255), kIdLabelThickness);
     }
 }
 
@@ -291,12 +292,16 @@ void processCamera(CameraConfig& cfg) {
     uint64_t last_perf_decode_seq = 0;
     int last_submitted_frame_id = -1;
     int last_processed_result_id = -1;
-    // 双向闸机计数（与 ByteTrack ID 绑定）。标记线 = cfg.entry_line(t1)。
-    // 每个摄像头都做双向判定：外→内=进入类，内→外消失=离开类，角色决定标签。
-    // 201(入口)：外→内=IN，内→外消失=RETRO；200(出口)：外→内=RETRO，内→外消失=OUT。
+    // 跨标记线闸机计数（与 ByteTrack ID 绑定，ID 全程维护区域标记）。
+    // 几何：R0 区域外(检测区多边形之外 = 出口) / R1 入口带(t1 向检测区内 depth px)
+    //       / R2 检测区内(检测区多边形)。出口区域已删除。
+    // 触发源 = 本相机标记线(t1)的"侧翻转边沿"：每跨一次线恰好计一次（与 ID 生命周期解耦，
+    // 同一 ID 多次往返每次都计）。角色只负责给事件贴标签：
+    //   201(入口)：线外→线内 = IN，线内→线外 = RETRO
+    //   200(出口)：线外→线内 = RETRO，线内→线外 = OUT
     GateIdCounter gate_counter(cfg.role == 1 ? GATE_ROLE_EXIT : GATE_ROLE_ENTRY,
                                cfg.entry_line,
-                               cfg.entry_zone_depth, cfg.exit_zone_depth);
+                               cfg.entry_zone_depth, cfg.detection_mask);
     int gate_flash = 0;  // 计数事件后的标记线闪烁帧数
 
     while (!cfg.stop_flag && g_running) {
@@ -355,9 +360,11 @@ void processCamera(CameraConfig& cfg) {
         cfg.mode_count = cfg.calculateMode(zn);
         cfg.total_count = (int)tracks.size();
 
-        // ==================== 双向闸机计数（与 ByteTrack ID 绑定）====================
-        // 201(入口)：外→内=IN，内→外消失=RETRO；200(出口)：外→内=RETRO，内→外消失=OUT。
-        // 遮挡期间 ByteTrack 保持同一 ID 预测输出，不会重复计数；只有 ID 真正消失才结算。
+        // ==================== 跨标记线闸机计数（与 ByteTrack ID 绑定）====================
+        // 触发源 = 本相机标记线(t1)的侧翻转边沿：线外→线内 = 进入类，线内→线外 = 离开类。
+        // 201(入口)：进入类=IN，离开类=RETRO；200(出口)：进入类=RETRO，离开类=OUT。
+        // 同一 ID 可反复往返，每跨一次线计一次；遮挡期间预测框只维持 ID 连续、不改变所在侧；
+        // ID 被切换时由交接继承"所在侧"（不继承一次性封顶），不重计不漏计。
         auto gate_events = gate_counter.update(tracks);
         for (const auto& event : gate_events) {
             gate_flash = 15;
@@ -372,12 +379,41 @@ void processCamera(CameraConfig& cfg) {
                 cfg.retro_count++;
                 name = "RETRO";
             }
+            const std::string origin_tag = event.origin_id >= 0
+                ? (" origin=" + std::to_string(event.origin_id)) : std::string();
             std::cerr << "[GATE] ts=" << capture_ms << " " << cfg.unique_id
                       << " track=" << event.track_id << " event=" << name
+                      << " reason=" << event.reason
+                      << " region=R" << event.region
+                      << (event.via_entry_band ? " via_entry_band" : "")
+                      << (event.settled ? " settled" : "")
+                      << origin_tag
+                      << " lost=" << event.lost_frames
                       << " foot=(" << event.foot.x << "," << event.foot.y << ")"
                       << " IN:" << cfg.in_count.load()
                       << " OUT:" << cfg.out_count.load()
                       << " RETRO:" << cfg.retro_count.load() << "\n";
+        }
+        // 每个 ID 的区域标记（req1）：R0=区域外(出口侧) R1=入口带 R2=检测区内，
+        // 以及"是否标记在区域内"（粘滞，只有确认离开才翻转）。
+        std::map<int, GateIdMark> id_marks;
+        for (const auto& m : gate_counter.marks()) id_marks[m.track_id] = m;
+        const int ids_inside = gate_counter.insideCount();
+        if (g_enable_zone_trace && !gate_events.empty()) {
+            for (const auto& kv : id_marks) {
+                const GateIdMark& m = kv.second;
+                // 只打印当前仍在 tracker 输出里的 ID：已消失(lost>0)或已被交接封存的旧 ID
+                // 不再刷屏，避免日志里出现"幽灵 ID"（交接来源已由 inherited_from= 表达）
+                if (m.lost_frames > 0) continue;
+                std::cerr << "[GATEMARK] " << cfg.unique_id << " track=" << m.track_id
+                          << " region=R" << m.region
+                          << " mark=" << (m.inside ? "INSIDE" : "OUTSIDE")
+                          << " entered=" << (m.entered ? 1 : 0)
+                          << " exited=" << (m.exited ? 1 : 0)
+                          << (m.inherited ? " inherited_from=" : " origin=")
+                          << m.origin_id
+                          << " lost=" << m.lost_frames << "\n";
+            }
         }
         if (g_enable_display &&
             (++display_result_counter % kDisplayEveryResults == 0)) {
@@ -419,12 +455,11 @@ void processCamera(CameraConfig& cfg) {
                 cv::putText(dp, dz, cv::Point((int)mid.x-22,(int)mid.y),
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, fill*0.8, 1);
             };
-            // 入标记区域(绿, 向检测区内) + 出标记区域(红, 向检测区外) + 标记线
+            // 入口带(绿, t1 向检测区内延伸) + 入口绊线；出口区域已删除（检测区外即出口）
             drawZone(cfg.entry_line, cfg.entry_zone_depth, cv::Scalar(0,160,0));
-            drawZone(cfg.entry_line, -cfg.exit_zone_depth, cv::Scalar(0,0,160));
             drawTripLine(cfg.entry_line, cv::Scalar(0,255,0));
         }
-        // 轨迹调试: 脚底点 + 计数闪烁
+        // 轨迹调试: 脚底点 + 每 ID 区域标记 + 计数闪烁
         {
             float sx = (float)cfg.display_w / raw.cols;
             float sy = (float)cfg.display_h / raw.rows;
@@ -435,15 +470,32 @@ void processCamera(CameraConfig& cfg) {
                 cv::Point p2((int)(cfg.entry_line.p2.x*sx), (int)(cfg.entry_line.p2.y*sy));
                 cv::line(dp, p1, p2, cv::Scalar(0,255,255), 5, cv::LINE_AA);  // 亮青闪烁
             }
-            // 脚底点
+            // 脚底点 + 区域标记：绿色=标记在区域内, 橙色=标记在区域外(R0)
             for (auto& t : tracks) {
                 cv::Point2f foot(t.box.x + t.box.width/2.0f, t.box.y + t.box.height*0.92f);
-                cv::circle(dp, cv::Point((int)(foot.x*sx), (int)(foot.y*sy)), 3, cv::Scalar(0,255,0), -1);
+                auto mit = id_marks.find(t.track_id);
+                const bool has_mark = (mit != id_marks.end());
+                // 没有标记的 ID（极少数：状态已清理但 tracker 仍在输出预测框）用实时区域兜底，
+                // 保证画面上不会再出现标不出区域的 "R?" 幽灵框
+                const int reg = has_mark ? mit->second.region : gate_counter.regionOf(foot);
+                const bool inside_mark = has_mark ? mit->second.inside
+                                                  : (reg == GATE_REGION_DETECT);
+                const cv::Scalar foot_col = inside_mark ? cv::Scalar(0,255,0)
+                                                        : cv::Scalar(0,165,255);
+                cv::circle(dp, cv::Point((int)(foot.x*sx), (int)(foot.y*sy)), 4, foot_col, -1);
+                // ID 区域标记文本：R0 区域外 / R1 入口带 / R2 检测区内 + INSIDE/OUTSIDE 标记
+                const std::string tag = "R" + std::to_string(reg)
+                                      + (inside_mark ? " INSIDE" : " OUTSIDE");
+                const int bx = (int)(t.box.x * sx);
+                const int by = (int)((t.box.y + t.box.height) * sy) + 14;
+                cv::putText(dp, tag, cv::Point(bx, by), cv::FONT_HERSHEY_SIMPLEX,
+                            0.45, foot_col, 1);
             }
         }
         // 第一行：黄色，基础信息
         std::string info1 = cfg.unique_id + " Zone:" + std::to_string(zn)
-                          + " Tot:" + std::to_string((int)tracks.size());
+                          + " Tot:" + std::to_string((int)tracks.size())
+                          + " IDsIn:" + std::to_string(ids_inside);
         cv::putText(dp, info1, cv::Point(5, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,255,255), 1);
         // 第二行：红色大字，IN / OUT / RETRO 计数
         std::string info2 = "IN:" + std::to_string(cfg.in_count.load())
@@ -466,6 +518,7 @@ void processCamera(CameraConfig& cfg) {
             const auto perf = cfg.yolov8_pool->getStats();
             std::cout << cfg.unique_id << " FPS:" << cfg.fps << " Zone:" << zn
                      << " Tot:" << tracks.size()
+                     << " IDsIn:" << ids_inside
                      << " IN:" << cfg.in_count.load()
                      << " OUT:" << cfg.out_count.load()
                      << " RETRO:" << cfg.retro_count.load()

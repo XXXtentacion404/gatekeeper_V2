@@ -154,11 +154,11 @@ void drawFrame(cv::Mat& img,
         cv::rectangle(img, sbox, t.color, 2);
         std::string label = "P" + std::to_string(t.track_id);
         int baseline;
-        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 1.20, 2, &baseline);
         cv::rectangle(img, cv::Point(sbox.x, sbox.y - ts.height - 4),
                       cv::Point(sbox.x + ts.width, sbox.y), t.color, cv::FILLED);
         cv::putText(img, label, cv::Point(sbox.x, sbox.y - 4),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                    cv::FONT_HERSHEY_SIMPLEX, 1.20, cv::Scalar(255, 255, 255), 2);
 
         // foot point
         cv::Point2f foot(sbox.x + sbox.width/2.0f, sbox.y + sbox.height*0.92f);
@@ -444,9 +444,14 @@ int main(int argc, char** argv) {
 
     vdc.detection_mask = createDetectionMask(cfg.width, cfg.height, cfg.detection_zones);
     vdc.entry_line = cfg.entry_line;
-    vdc.exit_line = cfg.exit_line;
+    // req4：出口区域已删除，CameraConfigEntry 不再有 exit_line/exit_zone_depth（配置文件
+    // 也不再写 t2）。本工具仍用旧 tripwire_counter（其四区域模型必须有出口线才能计数），
+    // 故这里不再赋值——出口线保持无效，video_debug 退化为"检测/追踪可视化"，不产生计数事件。
+    // （main_tracking / main_headless 走新的 GateIdCounter，不受影响。）
     vdc.entry_zone_depth = cfg.entry_zone_depth;
-    vdc.exit_zone_depth = cfg.exit_zone_depth;
+    std::cerr << "[V4] 注意：出口线已随出口区域一并删除，"
+                 "video_debug 不再输出 IN/OUT/RETRO 计数（仅可视化）。"
+              << std::endl;
     if (!vdc.detection_mask.empty()) {
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(vdc.detection_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
