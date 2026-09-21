@@ -118,10 +118,16 @@ struct CameraConfigEntry {
     int width;
     int height;
     std::vector<std::vector<cv::Point>> detection_zones;
-    // 入口绊线 (t1)：作为"入口带"基准线，向检测区内延伸 |entry_zone_depth| px。
-    // 出口区域已删除：检测区域之外一律视为出口（main_tracking 的 R0）。
+    // ---- 判定线（区域边缘，点数不限）----
+    // 旧格式 t1：2 点直线，作为区域的基准边，整体沿 x 平移 |entry_zone_depth| px。
     Tripwire entry_line;
-    float entry_zone_depth = 0; // 入口区域深度(px，符号决定延伸方向)，<1 = 无入口带
+    float entry_zone_depth = 0; // 区域沿 x 平移量(px，符号决定平移方向)，<1 = 无区域
+    // 新格式 zin,/zout,：判定线 = 区域边缘折线（点数不限，边缘不一定是直线）。
+    // 非空时优先于 entry_line；"区域边缘本身就是判定线"，区域 = 折线 ∪ 其 x 平移副本。
+    std::vector<cv::Point2f> zone_line;
+    // 本相机角色：-1 = 未指定（按 IP 末段判定：200=出口，201=入口），0 = 入口，1 = 出口。
+    // 由 zin,/zout, 这两种 token 决定 —— 由用户选择哪台相机画入口、哪台画出口。
+    int zone_role = -1;
 };
 
 // 日志宏

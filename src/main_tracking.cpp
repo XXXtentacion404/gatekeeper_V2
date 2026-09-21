@@ -50,13 +50,24 @@ constexpr int kDisplayRefreshMs = 50;
 constexpr int kDisplayEveryResults = 2;
 const int MAX_CAMERAS = 4;
 
+// ★ 跨线"站住"确认帧数（board 取值，2026-09-18）。
+// 一次确认的侧翻转，只有新的一侧被连续观测 ≥ 该帧数才结算（发事件 + 推进所在侧）；
+// 中途回到原侧 = 在线上蹭/徘徊 → 本次跨线整体作废（不发事件），进出计数保持配平。
+// 现场依据：2026-09-18 单人测试日志里 201 出现 RETRO 之后 752ms 紧跟一个 IN
+//  （IN 3→4），两次事件脚底只差 126px —— 典型的"跨过去又马上回来"。
+// 25 帧 ≈ 1.0~1.4s（板端实测 17~25 FPS）。真人过闸后在新侧会停留数秒，不受影响；
+// 万一真人快速穿过而站不够帧数，仍有「消失回补」「交接兑付」两条独立证据兜底。
+// 调大 = 更不容易把徘徊算成跨线，但更快穿过的人更容易漏计；调小反之。
+constexpr int kCrossDwellFrames = 25;
+
 // comm.cpp 依赖的全局变量
 std::atomic<uint16_t> g_max_box_count(0);
 std::atomic<bool> g_need_clear_queues{false};
 
-// 双向闸机 + 每摄像头独立计数：201 计 IN/RETRO，200 计 RETRO/OUT，
-// 每个 ByteTrack ID 至多一次"进入类"+一次"离开类"事件，无需双摄融合去重
-// （旧 reportFusedEvent / g_fused_* 已移除）。
+// 双向闸机 + 每摄像头独立计数：201 计 IN/RETRO，200 计 RETRO/OUT。
+// 计数与 ID 生命周期解耦：同一 ID 每跨一次判定线就计一次（跨线边沿触发），
+// 不再有"每个 ID 至多 1 进 1 出"的封顶（旧 reportFusedEvent / g_fused_* 已移除）。
+// ⚠️ 跨线必须"站住" kCrossDwellFrames 帧才算（见上面的常量），防在线上蹭被误计。
 
 // ==================== 摄像头配置 ====================
 struct CameraConfig {
@@ -84,9 +95,11 @@ struct CameraConfig {
     cv::Mat detection_mask;
     cv::Mat mask_overlay;
     
-    // 标记线区域（多区域状态机：区域外 → 入口带 → 检测区）
-    Tripwire entry_line;             // 入口绊线（config 里 t1），入口带基准线
-    float entry_zone_depth = 100.0f; // 入口带深度(px)：t1 向检测区内延伸；<1 = 无入口带
+    // 标记线 / 判定线（区域边缘折线，点数不限；区域 = 折线 ∪ 其沿 x 平移的副本）
+    Tripwire entry_line;             // 旧格式 t1（2 点直线），作为区域边缘折线的一种特例
+    std::vector<cv::Point2f> zone_line;  // 新格式 zin,/zout, 的判定线折线；非空时优先
+    float entry_zone_depth = 100.0f; // 区域沿 x 平移量(px, 带符号)：朝检测区侧；<1 = 无区域
+    int zone_role = -1;              // 配置文件里是否显式指定了角色(-1=未指定，按 IP 判定)
     int role = 0;                    // 0=入口摄像头(201) 1=出口摄像头(200)
     std::atomic<int> in_count{0};    // 进入累计
     std::atomic<int> out_count{0};   // 离开累计
@@ -107,6 +120,10 @@ struct CameraConfig {
     CameraConfig(const CameraConfig&) = delete;
     CameraConfig& operator=(const CameraConfig&) = delete;
     
+    // ⚠️ 手写 move 构造：**新增字段必须在这里同步转发**，否则 loadCameras 里赋的值会被
+    // 静默丢掉（vector 扩容 / emplace_back 都会走这里）。
+    // 2026-09-16 实际踩过：zone_line / zone_role 漏转发 + loadCameras 漏赋值 →
+    // 板端"画面不画区域 + IN/OUT/RETRO 全程 0"（Region/Zone 显示仍正常，极具迷惑性）。
     CameraConfig(CameraConfig&& o) noexcept
         : unique_id(std::move(o.unique_id)), ip(std::move(o.ip)),
           username(std::move(o.username)), password(std::move(o.password)),
@@ -121,7 +138,9 @@ struct CameraConfig {
           fps(o.fps), detection_mask(std::move(o.detection_mask)),
           mask_overlay(std::move(o.mask_overlay)),
           entry_line(o.entry_line),
+          zone_line(std::move(o.zone_line)),
           entry_zone_depth(o.entry_zone_depth),
+          zone_role(o.zone_role),
           role(o.role),
           in_count(o.in_count.load()), out_count(o.out_count.load()),
           retro_count(o.retro_count.load()),
@@ -147,6 +166,17 @@ struct CameraConfig {
     void clearRecent() { std::lock_guard<std::mutex> lk(count_mutex); recent_counts.clear(); }
 };
 std::vector<CameraConfig> cameras;
+
+// 本相机角色的"有意义计数"文本：入口(role=0/201) 只会出 IN+RETRO；出口(role=1/200) 只会出 OUT+RETRO。
+// 另一项在整个运行期恒为 0（入口相机不会产生 OUT 事件，出口相机不会产生 IN 事件），
+// 显示它只是噪音 —— 日志 / OSD / 状态行三处都用这个函数，保证口径一致。
+static std::string gateCountSummary(const CameraConfig& cfg) {
+    if (cfg.role == 0)   // 入口：跨线进入类=IN，离开类=RETRO
+        return "IN:" + std::to_string(cfg.in_count.load())
+             + " RETRO:" + std::to_string(cfg.retro_count.load());
+    return "OUT:" + std::to_string(cfg.out_count.load())
+         + " RETRO:" + std::to_string(cfg.retro_count.load());
+}
 
 // ==================== 海康回调 ====================
 void CALLBACK DecCBFun(int nPort, char* pBuf, int nSize, FRAME_INFO* pFrameInfo, void* nUser, int) {
@@ -206,7 +236,9 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
         cc.ip = c.ip; cc.username = c.username; cc.password = c.password; cc.channel = c.channel;
         cc.detection_mask = createDetectionMask(c.width, c.height, c.detection_zones);
         cc.entry_line = c.entry_line;
-        cc.entry_zone_depth = c.entry_zone_depth;  // 入口带深度(带符号表延伸方向)
+        cc.zone_line = c.zone_line;                // 新格式 zin,/zout, 的判定线折线（≥2 点时优先）
+        cc.zone_role = c.zone_role;                // -1=未指定(按 IP) / 0=入口 / 1=出口
+        cc.entry_zone_depth = c.entry_zone_depth;  // 区域沿 x 平移量(带符号)
         if (!cc.detection_mask.empty()) {
             std::vector<std::vector<cv::Point>> ct;
             cv::findContours(cc.detection_mask, ct, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -215,12 +247,32 @@ std::vector<CameraConfig> loadCameras(const std::string& f) {
         }
         std::string base = c.ip + "_Ch" + std::to_string(c.channel);
         cc.unique_id = base + "_" + std::to_string(++cnt[base]);
-        // 相机角色：IP 末段 200=出口摄像头(只计OUT)，201=入口摄像头(只计IN)。
-        {
+        // 相机角色：优先用配置文件里显式写的角色（zin,=入口 / zout,=出口，由用户选择
+        // 哪台相机画入口、哪台画出口）；没写角色时退回 IP 末段：200=出口，201=入口。
+        if (cc.zone_role >= 0) {
+            cc.role = cc.zone_role;
+        } else {
             std::string tail = c.ip;
             auto dot = tail.find_last_of('.');
             if (dot != std::string::npos) tail = tail.substr(dot + 1);
             cc.role = (tail == "200") ? 1 : 0;  // 默认入口（含 201 及其他）
+        }
+        // 判定线来源自检：折线(zin,/zout,) > 旧格式(t1,) > 无。
+        // "无"意味着这台相机永远不会产生 IN/OUT/RETRO —— 必须吵出来，不能静默失败。
+        const bool has_poly_line = (cc.zone_line.size() >= 2);
+        const bool has_trip_line = cc.entry_line.isValid();
+        std::cout << "[INFO] " << cc.unique_id << " 判定线="
+                  << (has_poly_line
+                          ? ("折线(zin/zout) " + std::to_string(cc.zone_line.size()) + " 点")
+                          : (has_trip_line ? std::string("旧格式 t1 (2 点)")
+                                           : std::string("**无**")))
+                  << ", 角色=" << (cc.role == 0 ? "入口" : "出口")
+                  << ", 区域沿 x 平移 " << cc.entry_zone_depth << "px" << std::endl;
+        if (!has_poly_line && !has_trip_line) {
+            std::cerr << "[GATE] ERROR: " << cc.unique_id
+                      << " 配置里既没有 zin,/zout, 折线也没有 t1, 直线 → 本相机不会产生任何"
+                         " IN/OUT/RETRO 事件。请检查 cameras_config.txt 这一行末尾的判定线 token"
+                         "（顶点必须成对且 ≥2 点）。\n";
         }
         out.emplace_back(std::move(cc));
     }
@@ -293,15 +345,20 @@ void processCamera(CameraConfig& cfg) {
     int last_submitted_frame_id = -1;
     int last_processed_result_id = -1;
     // 跨标记线闸机计数（与 ByteTrack ID 绑定，ID 全程维护区域标记）。
-    // 几何：R0 区域外(检测区多边形之外 = 出口) / R1 入口带(t1 向检测区内 depth px)
-    //       / R2 检测区内(检测区多边形)。出口区域已删除。
-    // 触发源 = 本相机标记线(t1)的"侧翻转边沿"：每跨一次线恰好计一次（与 ID 生命周期解耦，
+    // 几何：R0 区域外(判定线外侧 = 出口侧) / R1 区域(判定线 ∪ 其 x 平移副本) / R2 检测区内。
+    // 判定线 = 区域边缘折线（zin,/zout, 给出，点数不限；无则退回 t1 的 2 点直线）。
+    // 触发源 = 本相机判定线的"侧翻转边沿"：每跨一次线恰好计一次（与 ID 生命周期解耦，
     // 同一 ID 多次往返每次都计）。角色只负责给事件贴标签：
-    //   201(入口)：线外→线内 = IN，线内→线外 = RETRO
-    //   200(出口)：线外→线内 = RETRO，线内→线外 = OUT
-    GateIdCounter gate_counter(cfg.role == 1 ? GATE_ROLE_EXIT : GATE_ROLE_ENTRY,
-                               cfg.entry_line,
-                               cfg.entry_zone_depth, cfg.detection_mask);
+    //   入口：线外→线内 = IN，线内→线外 = RETRO
+    //   出口：线外→线内 = RETRO，线内→线外 = OUT
+    GateRole gate_role = (cfg.role == 1) ? GATE_ROLE_EXIT : GATE_ROLE_ENTRY;
+    // 最后一个参数 = 跨线"站住"确认帧数：只有在新的一侧连续观测 ≥ kCrossDwellFrames 帧
+    // 才结算这次跨线；中途回到原侧（在线上蹭/徘徊）则整对事件作废。见该常量处的注释。
+    GateIdCounter gate_counter = cfg.zone_line.size() >= 2
+        ? GateIdCounter(gate_role, cfg.zone_line, cfg.entry_zone_depth, cfg.detection_mask,
+                        kCrossDwellFrames)
+        : GateIdCounter(gate_role, cfg.entry_line, cfg.entry_zone_depth, cfg.detection_mask,
+                        kCrossDwellFrames);
     int gate_flash = 0;  // 计数事件后的标记线闪烁帧数
 
     while (!cfg.stop_flag && g_running) {
@@ -390,9 +447,7 @@ void processCamera(CameraConfig& cfg) {
                       << origin_tag
                       << " lost=" << event.lost_frames
                       << " foot=(" << event.foot.x << "," << event.foot.y << ")"
-                      << " IN:" << cfg.in_count.load()
-                      << " OUT:" << cfg.out_count.load()
-                      << " RETRO:" << cfg.retro_count.load() << "\n";
+                      << " " << gateCountSummary(cfg) << "\n";
         }
         // 每个 ID 的区域标记（req1）：R0=区域外(出口侧) R1=入口带 R2=检测区内，
         // 以及"是否标记在区域内"（粘滞，只有确认离开才翻转）。
@@ -424,51 +479,60 @@ void processCamera(CameraConfig& cfg) {
         {
             float sx = (float)cfg.display_w / raw.cols;
             float sy = (float)cfg.display_h / raw.rows;
-            auto scalePt = [&](const cv::Point2f& p){ return cv::Point2f(p.x*sx,p.y*sy); };
-            auto drawTripLine = [&](const Tripwire& tw, cv::Scalar col) {
-                if (!tw.isValid()) return;
-                cv::Point p1(scalePt(tw.p1)), p2(scalePt(tw.p2));
-                cv::line(dp, p1, p2, col, 3);
+            auto scalePoly = [&](const std::vector<cv::Point2f>& src) {
+                std::vector<cv::Point> out;
+                out.reserve(src.size());
+                for (const auto& p : src)
+                    out.emplace_back((int)(p.x * sx), (int)(p.y * sy));
+                return out;
             };
-            auto drawZone = [&](const Tripwire& tw, float depth, cv::Scalar fill) {
-                if (!tw.isValid() || std::abs(depth) < 1.0f) return;
-                // v 沿外侧边法向 (右手系), 方向由 depth 符号决定
-                // 这样 5 参 t1,x1,y1,x2,y2,depth 唯一确定矩形朝向, 不依赖 gate_dir
-                cv::Point2f dir = tw.p2 - tw.p1;
-                float L = std::sqrt(dir.x*dir.x + dir.y*dir.y);
-                if (L < 1.0f) return;
-                cv::Point2f n(dir.y/L, -dir.x/L);  // 右手系法向
-                float s = std::abs(depth);
-                cv::Point2f v = n * (depth / s);   // 符号决定朝向
-                cv::Point2f o1=scalePt(tw.p1), o2=scalePt(tw.p2);
-                cv::Point2f i1=scalePt(tw.p1+cv::Point2f(v.x*s,v.y*s));
-                cv::Point2f i2=scalePt(tw.p2+cv::Point2f(v.x*s,v.y*s));
-                std::vector<cv::Point> pts={{(int)o1.x,(int)o1.y},{(int)o2.x,(int)o2.y},
-                                            {(int)i2.x,(int)i2.y},{(int)i1.x,(int)i1.y}};
+            // 角色配色：入口绿 / 出口红（与工具端一致）
+            const bool is_entry_cam = (gate_role == GATE_ROLE_ENTRY);
+            const cv::Scalar line_col = is_entry_cam ? cv::Scalar(0,255,0)
+                                                     : cv::Scalar(0,0,255);
+            const cv::Scalar zone_col = is_entry_cam ? cv::Scalar(0,160,0)
+                                                     : cv::Scalar(0,0,160);
+            // 区域 = 判定线 ∪ 其沿 x 平移副本。几何直接取自 counter（与计数同源，
+            // 避免"画面画的区域"与"实际判定用的几何"不一致）。
+            const std::vector<cv::Point2f>& ring = gate_counter.zoneRing();
+            if (ring.size() >= 3) {
+                std::vector<cv::Point> pts = scalePoly(ring);
                 cv::Mat overlay; dp.copyTo(overlay);
-                cv::fillConvexPoly(overlay, pts, fill);
-                cv::addWeighted(overlay,0.4,dp,0.6,0,dp);
-                cv::line(dp, {(int)o1.x,(int)o1.y},{(int)o2.x,(int)o2.y}, fill*0.8, 2);
-                // 深度标签 (带符号, + 朝法向, - 朝反法向)
-                char dz[16]; snprintf(dz, 16, "%+.0fpx", depth);
-                cv::Point2f mid = (o1+o2+i1+i2)*0.25f;
-                cv::putText(dp, dz, cv::Point((int)mid.x-22,(int)mid.y),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.4, fill*0.8, 1);
-            };
-            // 入口带(绿, t1 向检测区内延伸) + 入口绊线；出口区域已删除（检测区外即出口）
-            drawZone(cfg.entry_line, cfg.entry_zone_depth, cv::Scalar(0,160,0));
-            drawTripLine(cfg.entry_line, cv::Scalar(0,255,0));
+                cv::fillPoly(overlay, std::vector<std::vector<cv::Point>>{pts}, zone_col);
+                cv::addWeighted(overlay, 0.4, dp, 0.6, 0, dp);
+                cv::polylines(dp, pts, true, zone_col, 2);
+                // 平移量标签（带符号）
+                cv::Moments m = cv::moments(pts);
+                if (m.m00 > 1.0) {
+                    char dz[24];
+                    snprintf(dz, 24, "x%+.0fpx", cfg.entry_zone_depth);
+                    cv::putText(dp, dz, cv::Point((int)(m.m10/m.m00) - 24, (int)(m.m01/m.m00)),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, zone_col, 1);
+                }
+            }
+            // 判定线（区域边缘折线）：跨过它 = 一次计数
+            const std::vector<cv::Point2f>& jline = gate_counter.judgingLine();
+            if (jline.size() >= 2) {
+                std::vector<cv::Point> pts = scalePoly(jline);
+                cv::polylines(dp, pts, false, line_col, 3);
+                for (const auto& p : pts) cv::circle(dp, p, 3, line_col, -1);   // 折点
+            }
         }
         // 轨迹调试: 脚底点 + 每 ID 区域标记 + 计数闪烁
         {
             float sx = (float)cfg.display_w / raw.cols;
             float sy = (float)cfg.display_h / raw.rows;
-            // 计数事件后闪烁标记线
+            // 计数事件后闪烁判定线
             if (gate_flash > 0) {
                 gate_flash--;
-                cv::Point p1((int)(cfg.entry_line.p1.x*sx), (int)(cfg.entry_line.p1.y*sy));
-                cv::Point p2((int)(cfg.entry_line.p2.x*sx), (int)(cfg.entry_line.p2.y*sy));
-                cv::line(dp, p1, p2, cv::Scalar(0,255,255), 5, cv::LINE_AA);  // 亮青闪烁
+                const auto& jl = gate_counter.judgingLine();
+                if (jl.size() >= 2) {
+                    std::vector<cv::Point> pts;
+                    pts.reserve(jl.size());
+                    for (const auto& p : jl)
+                        pts.emplace_back((int)(p.x*sx), (int)(p.y*sy));
+                    cv::polylines(dp, pts, false, cv::Scalar(0,255,255), 5, cv::LINE_AA);  // 亮青闪烁
+                }
             }
             // 脚底点 + 区域标记：绿色=标记在区域内, 橙色=标记在区域外(R0)
             for (auto& t : tracks) {
@@ -497,10 +561,8 @@ void processCamera(CameraConfig& cfg) {
                           + " Tot:" + std::to_string((int)tracks.size())
                           + " IDsIn:" + std::to_string(ids_inside);
         cv::putText(dp, info1, cv::Point(5, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,255,255), 1);
-        // 第二行：红色大字，IN / OUT / RETRO 计数
-        std::string info2 = "IN:" + std::to_string(cfg.in_count.load())
-                          + "  OUT:" + std::to_string(cfg.out_count.load())
-                          + "  RETRO:" + std::to_string(cfg.retro_count.load());
+        // 第二行：红色大字，只显示本相机角色的计数（入口=IN/RETRO，出口=OUT/RETRO）
+        std::string info2 = gateCountSummary(cfg);
         cv::putText(dp, info2, cv::Point(5, 42), cv::FONT_HERSHEY_SIMPLEX, 0.60, cv::Scalar(0,0,255), 2);
         { std::lock_guard<std::mutex> lk(cfg.display_ptr_mutex); cfg.display_frame_ptr = std::make_shared<cv::Mat>(dp); }
         }
@@ -519,9 +581,7 @@ void processCamera(CameraConfig& cfg) {
             std::cout << cfg.unique_id << " FPS:" << cfg.fps << " Zone:" << zn
                      << " Tot:" << tracks.size()
                      << " IDsIn:" << ids_inside
-                     << " IN:" << cfg.in_count.load()
-                     << " OUT:" << cfg.out_count.load()
-                     << " RETRO:" << cfg.retro_count.load()
+                     << " " << gateCountSummary(cfg)
                      << std::endl;
             std::cout << "[PERF] " << cfg.unique_id
                       << " decode=" << decode_seq
@@ -534,6 +594,29 @@ void processCamera(CameraConfig& cfg) {
                       << " result_id=" << rid
                       << " lag=" << std::max(0, last_submitted_frame_id - rid)
                       << std::endl;
+            // --trace：周期打印每个活跃 ID 到【本相机判定线】的几何关系。
+            // 排查"某台相机全程 0 事件"时看这一行就够：
+            //   line_signed 一直同号且数值很大 → 人在线的同一侧，根本没跨过它；
+            //   带 (跨度外) 标记 → 人没走到这条折线覆盖的那段边界上（不是漏计，是线画的位置/长度问题）。
+            if (g_enable_zone_trace) {
+                // 诊断注记（GateIdCounter::notes()）：只在"关键瞬间"产生，用来回答
+                // "这个人在视频里明明有轨迹，为什么没计数" —— 例如某几帧只有预测框
+                // (observed=false，画面上有框但计数模块看不到)、某 ID 出生时就在线内侧等。
+                for (const auto& n : gate_counter.notes()) {
+                    std::cout << "[CAND] " << cfg.unique_id << " " << n << std::endl;
+                }
+                for (const auto& kv : id_marks) {
+                    const GateIdMark& m = kv.second;
+                    if (m.lost_frames > 0) continue;
+                    std::cout << "[TRACE] " << cfg.unique_id << " track=" << m.track_id
+                              << " region=R" << m.region
+                              << " line_signed=" << (int)m.line_signed << "px"
+                              << " side=" << (m.line_side < 0 ? "?" : (m.line_side == 1 ? "in" : "out"))
+                              << (m.line_active ? "" : " (跨度外)")
+                              << " mark=" << (m.inside ? "INSIDE" : "OUTSIDE")
+                              << std::endl;
+                }
+            }
         }
     }
     { std::lock_guard<std::mutex> lk(g_hik_mutex);

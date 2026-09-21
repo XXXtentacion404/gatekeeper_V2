@@ -235,11 +235,31 @@ std::vector<TripwireCountEvent> TripwireCounter::update(
         // 轨迹。旧 ID 封存（不可再发事件、不可终审结算），保证同一个物理的人
         // 跨 ID 切换仍然只有一对 IN/OUT。
         if (is_new_track) {
+            int best_old_id = -1;
+            float best_handover_score = -1.0f;
             for (auto& [old_id, old_state] : states_) {
                 if (old_id == track.track_id) continue;
                 if (old_state.lost_frames <= 0 ||
                     old_state.lost_frames > kHandoverMaxLostFrames) continue;
-                if (cv::norm(old_state.last_foot - foot) > kHandoverRadius) continue;
+                if (old_state.enter_events == 0 || old_state.exit_events != 0 ||
+                    !old_state.inside_committed) continue;
+                const float distance = cv::norm(old_state.last_foot - foot);
+                if (distance > kHandoverRadius) continue;
+                if (regionOf(foot) == 0) {
+                    const float ep = signedDist(old_state.last_foot, entry_line_, entry_normal);
+                    const float en = signedDist(foot, entry_line_, entry_normal);
+                    const float xp = signedDist(old_state.last_foot, exit_line_, exit_normal);
+                    const float xn = signedDist(foot, exit_line_, exit_normal);
+                    if (!((ep >= kCrossLineTolerance && en <= -kCrossLineTolerance) ||
+                          (xp >= kCrossLineTolerance && xn <= -kCrossLineTolerance))) continue;
+                }
+                const float score = 1.0f - distance / kHandoverRadius;
+                if (score <= best_handover_score) continue;
+                best_handover_score = score;
+                best_old_id = old_id;
+            }
+            if (best_old_id >= 0) {
+                State& old_state = states_.at(best_old_id);
                 state.enter_events = std::max(state.enter_events, old_state.enter_events);
                 state.exit_events = std::max(state.exit_events, old_state.exit_events);
                 state.inside_committed = old_state.inside_committed;
@@ -254,7 +274,6 @@ std::vector<TripwireCountEvent> TripwireCounter::update(
                 old_state.enter_events = state.enter_events;
                 old_state.exit_events = state.exit_events;
                 trace(track.track_id, "id-handover-inherited-context", state, -1);
-                break;
             }
         }
 

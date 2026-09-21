@@ -23,6 +23,7 @@ constexpr float kReidWAppear = 0.55f;
 constexpr float kReidScoreThresh = 0.45f;
 // 帧为空/直方图不可用时的保守兜底（只能靠距离+运动，门限更高）
 constexpr float kReidScoreThreshNoAppear = 0.60f;
+constexpr float kMinMatchAppearance = 0.28f;
 }
 
 ByteTrackTracker::ByteTrackTracker(float track_thresh, float high_thresh,
@@ -177,12 +178,15 @@ void ByteTrackTracker::greedyJointMatch(
             float iou_fast = calcIou(tracks[i].rect, dets[j].box);
             if (iou_fast < 0.05f) continue;
             // IoU 很高的直接给高分，跳过 Mahalanobis + 直方图
-            float s;
-            if (iou_fast > 0.7f) {
-                s = 0.7f * iou_fast + 0.3f * dets[j].confidence;
-            } else {
-                s = calcJointScore(tracks[i], dets[j], frame, det_hists[j]);
+            if (!tracks[i].appearance_hist.empty() &&
+                j < det_hists.size() && !det_hists[j].empty()) {
+                const float appearance = std::max(0.0f,
+                    (float)cv::compareHist(tracks[i].appearance_hist,
+                                           det_hists[j], cv::HISTCMP_CORREL));
+                if (appearance < kMinMatchAppearance) continue;
             }
+            const float s = calcJointScore(tracks[i], dets[j], frame,
+                                           det_hists[j]);
             if (s >= score_thresh)
                 pairs.push_back({s, (int)i, (int)j});
         }

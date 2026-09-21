@@ -9,7 +9,7 @@ gatekeeper_V4 — 检测区绘制 + 虚拟绊线 + 远程更新工具
 
 依赖: pip install PyQt5 opencv-python paramiko scp
 """
-import os, sys, re, cv2, time, socket, threading, subprocess, ipaddress
+import os, sys, re, cv2, time, socket, threading, subprocess, ipaddress, math
 import numpy as np
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -195,90 +195,194 @@ def scp_send(local_path, remote_ip, log_signal):
     return result[0], result[1]
 
 
-# ==================== 矩形<->线段换算（保持 5 参配置格式兼容 C++）====================
-# 关键: 直角矩形方向 = 外侧边法向 (右手系旋转 -90°), depth 符号表示
-#       矩形的"内侧"在外侧边法向的 + 侧 (depth>0) 或 - 侧 (depth<0)
-#       C++ 端用同样算法还原 (drawZone 沿外侧边法向 * depth 画矩形)
-def _rect_from_line_depth(p1, p2, depth):
-    """5 参 (外侧边 p1->p2, 带符号 depth) -> 4 点矩形
-       depth 正: 矩形朝 (p2-p1) 右手系法向方向; 负: 反向
-    """
-    if depth == 0:
-        return p1, p2
-    dx = p2[1] - p1[1]
-    dy = -(p2[0] - p1[0])
-    L = (dx*dx + dy*dy) ** 0.5
-    if L < 1: return p1, p2
-    ux, uy = dx/L, dy/L
-    s = abs(depth)
-    sign = 1 if depth > 0 else -1
-    p3 = (int(round(p1[0] + ux*s*sign)), int(round(p1[1] + uy*s*sign)))
-    p4 = (int(round(p2[0] + ux*s*sign)), int(round(p2[1] + uy*s*sign)))
-    return p3, p4
-
-
-def _rect_to_line_depth(zone):
-    """4 点矩形 -> (外侧边 p1->p2, 带符号深度)
-       深度 = (p3-p1) 和 (p4-p2) 在外侧边法向上的平均投影
-       符号: 矩形的"内侧"在外侧边法向的哪一侧 (保留方向信息)
-    """
-    if not zone or len(zone) != 4:
-        return None, 0
-    p1, p2, p3, p4 = zone
-    # 外侧边法向 (右手系旋转 -90°)
-    dx = p2[1] - p1[1]
-    dy = -(p2[0] - p1[0])
-    L = (dx*dx + dy*dy) ** 0.5
-    if L < 1: return [p1, p2], 0
-    ux, uy = dx/L, dy/L
-    # 平均深度 = (p3-p1) 和 (p4-p2) 在法向上的投影
-    d1 = (p3[0]-p1[0])*ux + (p3[1]-p1[1])*uy
-    d2 = (p4[0]-p2[0])*ux + (p4[1]-p2[1])*uy
-    depth = (d1 + d2) / 2
-    return [p1, p2], int(round(depth))
-
-
-# ==================== 多边形绘制 ====================
-# 入口带深度（px）：入口绊线(t1)向检测区内延伸这么多像素 = C++ 端的 R1 区域。
-# 出口区域已删除（req4）：检测区域多边形之外一律视为出口(R0)，配置文件不再写 t2。
-ENTRY_MARKER_DEPTH = 100
-
-
-def _depth_toward_detection(polys, p1, p2, depth=ENTRY_MARKER_DEPTH):
-    """判断绊线 p1->p2 的哪一侧朝向检测区中心，返回**带符号**深度。
-
-    右手系法向 u = (dy, -dx)/L 与 C++ inwardNormal 完全一致；depth>0 表示入口带
-    朝 u 方向延伸。旧配置文件的 t1 只有 4 个参数（没有深度），若当成 depth=0，
-    入口带会退化成一条线，保存时又会把板端 R1 区域抹掉，所以这里按检测区中心
-    自动定向补一个默认深度。
-    """
+# ==================== 判定线(区域边缘折线) -> 区域 换算（与 C++ 端严格互逆）====================
+# ⚠️ 三条约定必须与 C++ 端(gate_id_counter.cpp 的 evalLine / inwardNormal / zonePolygon)
+#    完全一致，否则 Python 画出来的区域和板端算出来的会分居判定线两侧：
+#   1) 判定线 = **区域边缘折线**（点数不限，区域边缘不一定是直线）。
+#      它本身就**是判定线**：脚底跨过它 = 一次计数（"跨过本相机的线"这一动作本身）。
+#   2) 区域的【形状】= 判定线 ∪ 其整体沿 x 平移 |平移量| px（y 不变）的副本，首尾相接成闭环。
+#      为什么不做"沿法向偏移的等距带"：边缘是斜线/折线时法向带也是斜的，与相邻区域拼不
+#      严实，走廊里会留缝；沿 x 平移后相邻区域共享同一条 x 方向边界，中间无缝。
+#   3) 平移量的【符号】= 内侧法向（右手系 (dy,-dx)/L 按 depth 符号定向）的 x 分量所指的那
+#      一侧（朝检测区），保证区域落在检测区一侧。
+def _right_hand_normal(p1, p2):
+    """右手系法向 (dy,-dx)/L —— 与 C++ inwardNormal 的基础约定一致。"""
     dx = p2[1] - p1[1]
     dy = -(p2[0] - p1[0])
     L = (dx*dx + dy*dy) ** 0.5
     if L < 1:
+        return 0.0, 0.0
+    return dx / L, dy / L
+
+
+def _poly_mid(pts):
+    """折线弧长中点 + 所属线段下标 —— 与 C++ midSegment()/lineMidPoint() 逐行对应。
+    C++ 用弧长中点所在的那一段的法向做"内侧方向"探测，这里必须完全一致。"""
+    n = len(pts) - 1
+    if n < 1:
+        return 0, (float(pts[0][0]), float(pts[0][1]))
+    lens = [math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1]) for i in range(n)]
+    half = sum(lens) * 0.5
+    acc = 0.0
+    for i, L in enumerate(lens):
+        if L < 1e-3:
+            continue
+        if acc + L >= half:
+            t = (half - acc) / L
+            return i, (pts[i][0] + (pts[i+1][0]-pts[i][0])*t,
+                       pts[i][1] + (pts[i+1][1]-pts[i][1])*t)
+        acc += L
+    return n - 1, (float(pts[-1][0]), float(pts[-1][1]))
+
+
+def _polyline_len(pts):
+    return sum(math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
+               for i in range(len(pts)-1))
+
+
+def _largest_polygon(polys):
+    """取顶点最多的那条多边形（C++ 端同样挑点数最多的轮廓做探测）。返回 (N,1,2) float32。"""
+    best, best_n = None, 0
+    for poly in (polys or []):
+        if len(poly) > best_n:
+            best, best_n = poly, len(poly)
+    if best is None or len(best) < 3:
+        return None
+    return np.array(best, dtype=np.float32).reshape(-1, 1, 2)
+
+
+def _resolve_depth_sign(polys, pts, depth):
+    """把平移量的符号校正为"指向检测区侧"。
+
+    算法与 C++ GateIdCounter 构造函数**逐行对应**：探测点 = 折线弧长中点 ± 该段右手系法向
+    * max(30,|depth|)，比较两点在检测区多边形内的深度，取更深的那一侧。
+    不这么做的话，配置里方向画反时 Python 的预览与板端会分居判定线两侧。
+    """
+    seg, mid = _poly_mid(pts)
+    ux, uy = _right_hand_normal(pts[seg], pts[seg + 1])
+    if ux == 0.0 and uy == 0.0:
         return depth
-    ux, uy = dx/L, dy/L
-    pts = [pt for poly in polys if len(poly) >= 3 for pt in poly]
-    if not pts:
-        return depth
-    cx = sum(x for x, y in pts) / len(pts)
-    cy = sum(y for x, y in pts) / len(pts)
-    dot = (cx - p1[0]) * ux + (cy - p1[1]) * uy
-    return depth if dot >= 0 else -depth
+    big = _largest_polygon(polys)
+    if big is None:
+        # 没有检测区多边形就无法判定内侧方向：沿用原值；|depth|<1 时按默认。
+        return depth if abs(depth) >= 1 else -ENTRY_MARKER_DEPTH
+    s = max(30.0, abs(depth))
+    d_pos = cv2.pointPolygonTest(big, (mid[0] + ux * s, mid[1] + uy * s), True)
+    d_neg = cv2.pointPolygonTest(big, (mid[0] - ux * s, mid[1] - uy * s), True)
+    # 内侧方向 = "mid + 法向"那一侧在检测区内更深就取 +，否则取 −；幅值沿用配置。
+    # ⚠️ 必须"先定方向、再乘幅值"，不能写成"d_neg>d_pos 就取反"：那样在配置里已经写成
+    #    负值时会把方向又翻回去（正负来回错），区域整体反相（由"导出->再导入"幂等自检抓出）。
+    side = 1.0 if d_pos >= d_neg else -1.0
+    if abs(depth) < 1:
+        return 100.0 * side
+    return abs(depth) * side
+
+
+def _x_offset_from_depth(pts, depth):
+    """带符号 depth -> x 方向平移量（y 不变，符号即左右）。
+    规则：平移方向 = 内侧法向的 x 分量所指的那一侧（与 C++ zoneOffsetX() 一致）。
+    例：depth=+100 且弧长中点那段的内侧法向 x 分量为负 → 返回 -100（向左平移）。
+    """
+    seg, _ = _poly_mid(pts)
+    ux, _ = _right_hand_normal(pts[seg], pts[seg + 1])
+    sign = 1.0 if depth >= 0 else -1.0
+    s = abs(depth)
+    return s if ux * sign >= 0 else -s
+
+
+def _zone_ring(pts, depth):
+    """判定线折线 + 其沿 x 平移副本 -> 闭环（区域轮廓，图像坐标）。
+    顺序 = [p1..pN, pN+off .. p1+off]，与 C++ zonePolygon(offset) 完全一致。
+    ⚠️ 闭环只用于**显示**；计数判据是脚底到判定线的法向投影，与闭环无关。"""
+    sx = _x_offset_from_depth(pts, depth)
+    shifted = [(x + sx, y) for x, y in pts]
+    return list(pts) + shifted[::-1]
+
+
+# ==================== 检测区边界吸附（判定线 = 区域边缘的一段）====================
+# 用户只点 2 个点，剩下的交给这两步：吸附到多边形边界，再取两点之间较短的那段弧。
+def _snap_to_ring(ring, pt):
+    """把点吸附到闭合折线上最近的位置。
+    返回 (边下标, 边内参数 t, 吸附点, 距离)。ring 不重复首点，约定 ring[-1]->ring[0] 也算一条边。"""
+    n = len(ring)
+    if n < 2:
+        return None
+    best = None
+    for i in range(n):
+        ax, ay = ring[i]
+        bx, by = ring[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        L2 = dx*dx + dy*dy
+        if L2 < 1e-6:
+            continue
+        t = ((pt[0]-ax)*dx + (pt[1]-ay)*dy) / L2
+        t = max(0.0, min(1.0, t))
+        px, py = ax + dx*t, ay + dy*t
+        d = math.hypot(pt[0]-px, pt[1]-py)
+        if best is None or d < best[3]:
+            best = (i, t, (int(round(px)), int(round(py))), d)
+    return best
+
+
+def _ring_arc(ring, sa, sb):
+    """闭合折线上 a->b 之间**较短**的那段，返回点列 [a, 中间顶点..., b]。
+    取短的那段是刻意的：闸口的区域边缘是"一条边界"，两点之间当然走近路。"""
+    n = len(ring)
+    if n < 3:
+        return [sa[2], sb[2]]
+    ea, ta = sa[0], sa[1]
+    eb, tb = sb[0], sb[1]
+    lens = [math.hypot(ring[(i+1) % n][0]-ring[i][0], ring[(i+1) % n][1]-ring[i][1])
+            for i in range(n)]
+    total = sum(lens)
+    cum = [0.0]
+    for L in lens:
+        cum.append(cum[-1] + L)
+    # 正向顶点：ea+1, ea+2, ... 直到 eb
+    fwd_idx, k = [], (ea + 1) % n
+    for _ in range(n + 1):
+        fwd_idx.append(k)
+        if k == eb:
+            break
+        k = (k + 1) % n
+    around = [sa[2]] + [ring[i] for i in fwd_idx] + [sb[2]]
+    if ea == eb:
+        # 两点落在同一条边上：较短的就是这条边自己的子段，另一段要绕整圈回来。
+        direct = [sa[2], sb[2]]
+        return direct if _polyline_len(direct) <= _polyline_len(around) else around
+    # 反向顶点：ea, ea-1, ... 直到 eb
+    bwd_idx, k = [], ea
+    for _ in range(n + 1):
+        bwd_idx.append(k)
+        if k == eb:
+            break
+        k = (k - 1) % n
+    back = [sa[2]] + [ring[i] for i in bwd_idx] + [sb[2]]
+    return around if _polyline_len(around) <= _polyline_len(back) else back
+
+
+# ==================== 多边形绘制 ====================
+# 区域沿 x 的默认平移量（px）：把判定线的所有顶点整体沿 x 平移这么多像素（y 不变）。
+# 与 C++ 端 zin,/zout, 未写 zo, 时的默认值一致。
+ENTRY_MARKER_DEPTH = 100
 
 
 class PolygonDrawer(QWidget):
-    MODE_POLYGON = 0
-    MODE_MARKER_LINE = 1   # 标记线: 选检测区域边界 2 点 -> 自动算入/出标记区域
+    MODE_POLYGON    = 0
+    MODE_ZONE_ENTRY = 1   # 画入口区域: 在检测区边界点 2 点 -> 自动取中间那段边缘 = 判定线
+    MODE_ZONE_EXIT  = 2   # 画出口区域: 同上（由用户决定哪台相机画入口/哪台画出口）
 
     def __init__(self):
         super().__init__()
         self.current = []         # 绘制中: [p1_disp, p2_disp]
-        self.polygons = []
-        # 4 点矩形: [(p1),(p2),(p3),(p4)]  p1->p2 绊线(外侧边), p3->p4 内侧边
-        self.entry_zone = None    # 入口带（t1 向检测区内 ENTRY_MARKER_DEPTH）
-        self.exit_zone = None     # 出口区域已删除（检测区外即出口），保留字段仅为兼容
-        self.marker_line = None   # 入口绊线 [p1, p2]（图像坐标）
+        self.polygons = []        # 检测区多边形（图像坐标，不重复首点）
+        # ---- 判定线（= 区域边缘折线）+ 区域 ----
+        # zone_line  = 判定线折线（图像坐标，点数不限）；脚底跨过它 = 一次计数
+        # zone_role  = 'entry' / 'exit' / None(旧 t1 格式，角色交给板端按 IP 判定)
+        # zone_depth = 带符号的 x 平移量；符号 = 朝检测区那一侧
+        self.zone_line = None
+        self.zone_role = None
+        self.zone_depth = 0
         self.mode = self.MODE_POLYGON
         self.drawing = False
         self.frame = None
@@ -287,6 +391,11 @@ class PolygonDrawer(QWidget):
         self.scale = 1.0; self.ox = self.oy = 0; self.dw = self.dh = 0
 
     def set_mode(self, mode): self.mode = mode; self.drawing = False; self.current = []
+
+    def _zone_role_of_mode(self):
+        if self.mode == self.MODE_ZONE_ENTRY: return 'entry'
+        if self.mode == self.MODE_ZONE_EXIT:  return 'exit'
+        return None
 
     def set_frame(self, f):
         self.frame = f.copy(); self.oh, self.ow = f.shape[:2]; self._geo(); self.update()
@@ -306,45 +415,55 @@ class PolygonDrawer(QWidget):
     def _clamp(self, p):
         return QPoint(max(self.ox,min(p.x(),self.ox+self.dw)), max(self.oy,min(p.y(),self.oy+self.dh)))
 
-    # ---- 入口绊线 -> 入口带 ----
-    def _compute_marker_zones(self, p1, p2):
-        """由入口绊线 [p1,p2] 和检测区域多边形，自动计算入口带。
-        入口带 = 绊线向检测区内延伸 ENTRY_MARKER_DEPTH px（C++ 端 R1 区域）。
-        出口区域已删除：检测区域多边形之外一律视为出口(R0)。"""
-        dx = p2[1] - p1[1]
-        dy = -(p2[0] - p1[0])
-        L = (dx*dx + dy*dy) ** 0.5
-        if L < 1:
-            return None, None
-        ux, uy = dx/L, dy/L   # 右手系法向 (与 C++ inwardNormal 约定一致)
-        # 检测区域中心（所有多边形点的平均）
-        cx = cy = None
-        pts = [pt for poly in self.polygons for pt in poly]
-        if pts:
-            cx = sum(x for x, y in pts) / len(pts)
-            cy = sum(y for x, y in pts) / len(pts)
-        if cx is not None:
-            dot = (cx - p1[0]) * ux + (cy - p1[1]) * uy
-            if dot < 0:
-                ux, uy = -ux, -uy   # 翻转，指向检测区内
-        entry = [p1, p2,
-                 (int(round(p1[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p1[1] + uy*ENTRY_MARKER_DEPTH))),
-                 (int(round(p2[0] + ux*ENTRY_MARKER_DEPTH)), int(round(p2[1] + uy*ENTRY_MARKER_DEPTH)))]
-        return entry, None
+    # ---- 标记线 -> 入口带（2 点整体沿 x 平移）----
+    def _pick_ring(self, a, b):
+        """在已有检测区多边形里挑一条"最贴近 a、b 两点"的闭合环（多区域配置时用）。"""
+        best, best_d = None, None
+        for poly in self.polygons:
+            if len(poly) < 2:
+                continue
+            sa = _snap_to_ring(poly, a); sb = _snap_to_ring(poly, b)
+            if sa is None or sb is None:
+                continue
+            d = sa[3] + sb[3]
+            if best_d is None or d < best_d:
+                best, best_d = poly, d
+        return best
+
+    def _edge_arc(self, a, b):
+        """在检测区多边形的边界上取 a->b 之间**较短**的那一段折线（= 判定线）。
+
+        用户只在边界上点 2 个点，这里把两点吸附到边界、再自动取中间那段 ——
+        这样判定线天然就是"区域的那条边缘"，边缘是折的/弯的都能跟着走，
+        不像以前那样只能得到一条直线。没有多边形可吸附时退化成两点直线。
+        """
+        ring = self._pick_ring(a, b)
+        if ring is None:
+            print("[提示] 还没有检测区多边形可吸附：判定线退化为这 2 点连成的直线。")
+            return [list(a), list(b)]
+        sa = _snap_to_ring(ring, a); sb = _snap_to_ring(ring, b)
+        if sa is None or sb is None:
+            return [list(a), list(b)]
+        arc = _ring_arc(ring, sa, sb)
+        # 两点几乎重合（点在边界上没挪动）→ 退化的判定线，没有任何意义
+        if _polyline_len(arc) < 10.0:
+            print("[提示] 这 2 点吸附到边界后几乎重合：判定线太短，已忽略这次点击。")
+            return None
+        return arc
 
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton: return
         if self.frame is None or self.dw <= 0 or self.dh <= 0: return   # 没有画面就没有坐标系，别画
         p = self._clamp(e.pos())
-        if self.mode == self.MODE_MARKER_LINE:
-            # 标记线: 两次点击分别确定 p1 / p2
+        if self.mode in (self.MODE_ZONE_ENTRY, self.MODE_ZONE_EXIT):
+            # 判定线: 在检测区边界上点 2 点
             if len(self.current) == 0:
                 self.current = [p]
                 self.drawing = True
             elif len(self.current) == 1:
                 self.current.append(p)
                 self.drawing = False
-                self._finish_marker_line()
+                self._finish_zone()
         else:
             self.drawing = True; self.current = [p]
         self.update()
@@ -361,7 +480,7 @@ class PolygonDrawer(QWidget):
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton: return
-        if self.mode == self.MODE_MARKER_LINE:
+        if self.mode in (self.MODE_ZONE_ENTRY, self.MODE_ZONE_EXIT):
             self.update()
             return
         if self.drawing and self.mode == self.MODE_POLYGON and len(self.current) > 2:
@@ -374,14 +493,31 @@ class PolygonDrawer(QWidget):
             self.drawing = False
         self.update()
 
-    def _finish_marker_line(self):
-        """标记线 2 点已选，自动计算入/出标记区域。"""
+    def _finish_zone(self):
+        """边界上 2 点已选：吸附出中间那段边缘 = 判定线，再据此算出区域。"""
         if len(self.current) < 2: return
-        p1 = self._to(self.current[0]); p2 = self._to(self.current[1])
-        self.marker_line = [p1, p2]
-        self.entry_zone, self.exit_zone = self._compute_marker_zones(p1, p2)
-        self.current = []
-        self.drawing = False
+        a = self._to(self.current[0]); b = self._to(self.current[1])
+        role = self._zone_role_of_mode()
+        if self.zone_line and self.zone_role and self.zone_role != role:
+            print(f"[提示] 本相机原有「{'入口' if self.zone_role=='entry' else '出口'}区域」，"
+                  f"已被新画的「{'入口' if role=='entry' else '出口'}区域」替换"
+                  f"（一台相机只有一条判定线）。")
+        arc = self._edge_arc(a, b)
+        self.current = []; self.drawing = False
+        if arc is None:
+            self.update(); return
+        self.zone_line = [[int(x), int(y)] for x, y in arc]
+        self.zone_role = role
+        # 平移方向朝检测区（算法与 C++ 构造器一致）；反向时这里会纠正回来
+        self.zone_depth = _resolve_depth_sign(self.polygons, self.zone_line, ENTRY_MARKER_DEPTH)
+        seg, _ = _poly_mid(self.zone_line)
+        ux, _ = _right_hand_normal(self.zone_line[seg], self.zone_line[seg + 1])
+        if abs(ux) < 0.25:
+            print(f"[警告] 判定线的中间线段接近水平(内侧法向 x 分量={ux:+.2f})：该处区域带宽"
+                  f"仅≈{abs(self.zone_depth*ux):.0f}px(趋于 0)。跨线判定不受影响；"
+                  f"若希望区域看上去更宽，可把判定线画在接近竖直的那段边缘上。")
+        print(f"[ok] {'入口' if role=='entry' else '出口'}判定线: "
+              f"{len(self.zone_line)} 个顶点, 沿 x 平移 {self.zone_depth:+.0f}px")
         self.update()
 
     def paintEvent(self, e):
@@ -403,54 +539,55 @@ class PolygonDrawer(QWidget):
             for poly in self.polygons:
                 p.drawPolygon(QPolygon([self._td(x,y) for x,y in poly]))
 
-        # 入口带 (绿)；出口区域已删除
-        # 存储顺序: zone = [p1, p2, p3, p4]  p1->p2 绊线(外侧边), p3->p4 内侧边
-        # 矩形顶点绘制顺序必须为 p1 -> p2 -> p4 -> p3 (顺时针或逆时针), 不能 p1->p2->p3->p4
-        # 否则 Qt drawPolygon 会画成 2 个三角形
-        for zone, fill, col, label in [
-            (self.entry_zone, QColor(0,255,0,50), QColor(0,160,0), "入口带"),
-        ]:
-            if zone and len(zone) == 4:
-                # 顶点顺序: p1, p2, p4, p3 (跳过 p3 到 p4 的对角)
-                pts_disp = [self._td(*zone[0]), self._td(*zone[1]),
-                            self._td(*zone[3]), self._td(*zone[2])]
-                path = QPainterPath(); path.moveTo(pts_disp[0])
-                for pp in pts_disp[1:]: path.lineTo(pp)
-                path.closeSubpath()
-                p.fillPath(path, fill)
-                # 4 边
-                p.setPen(QPen(col, 2))
-                p.drawPolygon(QPolygon(pts_disp))
-                # 标记线端点 (p1/p2) 高亮
-                p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
-                p.drawEllipse(self._td(*zone[0]), 5, 5)
-                p.drawEllipse(self._td(*zone[1]), 5, 5)
-                # 标签
-                cx = sum(x for x,y in zone) // 4
-                cy = sum(y for x,y in zone) // 4
-                tp = self._td(cx, cy)
-                p.setPen(QPen(col, 1))
-                p.drawText(tp.x()-20, tp.y()+5, label)
-
-        # 标记线 (黄, 高亮)
-        if self.marker_line and len(self.marker_line) == 2:
+        # ---- 区域（判定线 ∪ 其沿 x 平移副本）+ 判定线 ----
+        # 区域形状 = 判定线折线 + 它的 x 平移副本首尾相接成闭环；入口绿 / 出口红。
+        # ⚠️ 闭环只用于显示；板端计数判据是脚底到判定线的法向投影，与闭环无关。
+        if self.zone_line and len(self.zone_line) >= 2:
+            is_entry = (self.zone_role != 'exit')
+            fill = QColor(0,255,0,50) if is_entry else QColor(0,0,255,50)
+            col  = QColor(0,160,0)    if is_entry else QColor(0,0,160)
+            label = "入口区域" if is_entry else "出口区域"
+            depth = self.zone_depth if abs(self.zone_depth) >= 1 else ENTRY_MARKER_DEPTH
+            ring = _zone_ring(self.zone_line, depth)
+            pts  = [self._td(x, y) for x, y in ring]
+            path = QPainterPath(); path.moveTo(pts[0])
+            for pp in pts[1:]: path.lineTo(pp)
+            path.closeSubpath()
+            p.fillPath(path, fill)
+            p.setPen(QPen(col, 2)); p.setBrush(Qt.NoBrush)
+            p.drawPolygon(QPolygon(pts))
+            # 判定线（黄，高亮）—— 跨过它 = 一次计数
+            lpts = [self._td(x, y) for x, y in self.zone_line]
             p.setPen(QPen(QColor(255,255,0), 3))
-            p.drawLine(self._td(*self.marker_line[0]), self._td(*self.marker_line[1]))
+            p.drawPolyline(QPolygon(lpts))
+            # 折点高亮（首尾两点尤其重要：判定线的跨度端）
+            p.setBrush(QColor(255,255,255)); p.setPen(QPen(col, 2))
+            for pp in lpts: p.drawEllipse(pp, 4, 4)
+            p.drawEllipse(lpts[0], 6, 6); p.drawEllipse(lpts[-1], 6, 6)
+            # 标签 + 平移量
+            cx = sum(x for x, y in ring) // len(ring)
+            cy = sum(y for x, y in ring) // len(ring)
+            tp = self._td(cx, cy)
+            p.setPen(QPen(col, 1))
+            p.drawText(tp.x()-24, tp.y()+5, label)
+            p.drawText(tp.x()-24, tp.y()+22, f"x{self.zone_depth:+.0f}px")
 
-        # 画标记线过程中: 显示预览 (1 个点已放, 提示再点一次)
-        if self.drawing and self.mode == self.MODE_MARKER_LINE and self.current:
+        # 画判定线过程中: 显示预览 (1 个点已放, 提示再点一次)
+        if self.drawing and self.mode in (self.MODE_ZONE_ENTRY, self.MODE_ZONE_EXIT) and self.current:
             p1d = self.current[0]
             p.setBrush(QColor(255,255,255)); p.setPen(QPen(QColor(255,255,0), 2))
             p.drawEllipse(p1d, 5, 5)
-            p.drawText(p1d.x()+10, p1d.y()-10, "标记线起点已放, 再点一次 = 标记线终点")
+            p.drawText(p1d.x()+10, p1d.y()-10,
+                       "边界起点已放, 再点一次 = 边界终点(自动取中间那段边缘)")
 
         if len(self.current) > 1 and self.mode == self.MODE_POLYGON:
                 p.setPen(QPen(QColor(0,255,0), 2)); p.drawPolyline(QPolygon(self.current))
                 if len(self.current) > 2: p.drawLine(self.current[-1], self.current[0])
 
     def clear(self):
-        self.polygons = []; self.entry_zone = None; self.exit_zone = None
-        self.marker_line = None; self.update()
+        self.polygons = []
+        self.zone_line = None; self.zone_role = None; self.zone_depth = 0
+        self.update()
     def delete_last(self):
         if self.polygons: self.polygons.pop(); self.update()
     def set_polygons(self, ps, ow, oh):
@@ -459,26 +596,23 @@ class PolygonDrawer(QWidget):
         if not self.ow or not self.oh or ow <= 0 or oh <= 0: return
         sx, sy = self.ow/ow, self.oh/oh
         self.polygons = [[(int(x*sx),int(y*sy)) for x,y in p] for p in ps]; self.update()
-    def set_zones(self, entry_zone, exit_zone, ow, oh):
-        """设置 4 点矩形 (来自配置)，并据此重建标记线"""
+    def set_zone(self, line, role, depth, ow, oh):
+        """设置判定线折线 (来自配置)，点数不限。"""
         if not self.ow or not self.oh or ow <= 0 or oh <= 0: return
+        if not line or len(line) < 2: return
         sx, sy = self.ow/ow, self.oh/oh
-        if entry_zone and len(entry_zone) == 4:
-            self.entry_zone = [(int(x*sx),int(y*sy)) for x,y in entry_zone]
-            self.marker_line = [self.entry_zone[0], self.entry_zone[1]]
-        if exit_zone and len(exit_zone) == 4:
-            self.exit_zone = [(int(x*sx),int(y*sy)) for x,y in exit_zone]
+        self.zone_line = [(int(x*sx),int(y*sy)) for x,y in line]
+        self.zone_role = role
+        self.zone_depth = depth
         self.update()
     def rebase(self, ow_old, oh_old, ow_new, oh_new):
         """把一个图像坐标空间里的图形整体换算到另一个空间（分辨率变化时用）。
-        不做这一步的话，旧坐标会被当作新空间的坐标使用 → 多边形/入口带整体错位。"""
+        不做这一步的话，旧坐标会被当作新空间的坐标使用 → 多边形/区域整体错位。"""
         if not (ow_old and oh_old and ow_new and oh_new): return
         sx, sy = ow_new/ow_old, oh_new/oh_old
         def f(p): return (int(round(p[0]*sx)), int(round(p[1]*sy)))
         self.polygons = [[f(pt) for pt in poly] for poly in self.polygons]
-        if self.entry_zone:  self.entry_zone  = [f(pt) for pt in self.entry_zone]
-        if self.exit_zone:   self.exit_zone   = [f(pt) for pt in self.exit_zone]
-        if self.marker_line: self.marker_line = [f(pt) for pt in self.marker_line]
+        if self.zone_line: self.zone_line = [f(pt) for pt in self.zone_line]
         self.update()
 
 
@@ -587,7 +721,12 @@ class MainWindow(QMainWindow):
 
         r = QHBoxLayout()
         b = QPushButton("画区域"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_POLYGON)); r.addWidget(b)
-        b = QPushButton("画标记线"); b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_MARKER_LINE)); r.addWidget(b)
+        pl.addLayout(r)
+        r = QHBoxLayout()
+        b = QPushButton("画入口区域"); b.setToolTip("在检测区边界上点 2 点，自动取中间那段边缘作为判定线")
+        b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_ZONE_ENTRY)); r.addWidget(b)
+        b = QPushButton("画出口区域"); b.setToolTip("同上；由你决定哪台相机画入口、哪台画出口")
+        b.clicked.connect(lambda:self.drawer.set_mode(PolygonDrawer.MODE_ZONE_EXIT)); r.addWidget(b)
         pl.addLayout(r)
         
         r = QHBoxLayout()
@@ -595,8 +734,9 @@ class MainWindow(QMainWindow):
         b = QPushButton("清空全部"); b.clicked.connect(lambda:self.drawer.clear()); r.addWidget(b)
         pl.addLayout(r)
 
-        pl.addWidget(QLabel("步骤: 1)先画检测区域(多边形)  2)在区域边界点2点=标记线"))
-        pl.addWidget(QLabel("自动: 入口带 = 标记线向检测区内延伸100px（出口区域已删，检测区外即出口）"))
+        pl.addWidget(QLabel("步骤: 1)先画检测区域(多边形)  2)再画入口区域或出口区域"))
+        pl.addWidget(QLabel("在检测区边界上点 2 点 → 自动取中间那段边缘 = 判定线(折线)"))
+        pl.addWidget(QLabel("区域 = 判定线整体沿 x 平移 100px(y不变), 朝检测区侧; 跨过判定线 = 计数"))
         b = QPushButton("保存当前"); b.clicked.connect(self._save_cur); pl.addWidget(b)
         pg.setLayout(pl); cl.addWidget(pg)
         cl.addStretch()
@@ -714,31 +854,57 @@ class MainWindow(QMainWindow):
                         if len(pts) >= 3: polys.append(pts)
                         start = b + 1
 
-                    # 2) 再解析入口绊线 t1（5 参: t1,x1,y1,x2,y2,depth，depth 符号=入口带方向）
-                    entry = None
+                    # 2) 再解析判定线：新格式 zin,/zout,（区域边缘折线，点数不限）
+                    #    或旧格式 t1（2 点直线），可选 zo, 单独指定区域沿 x 的平移量。
+                    zone_line = None; zone_role = None
+                    zone_depth_raw = None      # 文件里显式写的平移量（t1 的 depth 或 zo,）
                     for token in rest:
-                        if token.startswith('t1,'):
+                        if token.startswith('zin,') or token.startswith('zout,'):
+                            role = 'entry' if token.startswith('zin,') else 'exit'
+                            parts = token[4:].replace(',', ' ').split()
+                            pts = []
+                            for k in range(0, len(parts) - 1, 2):
+                                try:
+                                    pts.append((int(float(parts[k])), int(float(parts[k+1]))))
+                                except ValueError:
+                                    pass
+                            if len(pts) >= 2:
+                                zone_line, zone_role = pts, role
+                            else:
+                                self._log(f"判定线点数不足(需要成对的顶点≥2点)，已忽略: {token}")
+                        elif token.startswith('t1,'):
                             parts = token[3:].replace(',', ' ').split()
                             if len(parts) < 4: continue
-                            p1 = (int(parts[0]), int(parts[1]))
-                            p2 = (int(parts[2]), int(parts[3]))
-                            if len(parts) >= 5 and int(parts[4]) != 0:
-                                depth = int(parts[4])
-                            else:
-                                # 旧格式 t1 只有 4 个参数（无深度）。若当成 depth=0，入口带会
-                                # 退化成一条线，保存时还会把板端 R1 区域抹掉 —— 按检测区中心
-                                # 方向补一个默认深度。
-                                depth = _depth_toward_detection(polys, p1, p2)
-                                self._log(f"t1 无深度，已按检测区方向补 {depth:+d}px")
-                            p3, p4 = _rect_from_line_depth(p1, p2, depth)
-                            entry = [p1, p2, p3, p4]
+                            p1 = (int(float(parts[0])), int(float(parts[1])))
+                            p2 = (int(float(parts[2])), int(float(parts[3])))
+                            zone_line = [p1, p2]
+                            zone_role = None      # 旧格式不指定角色 → 角色交给板端按 IP 判定
+                            if len(parts) >= 5:
+                                zone_depth_raw = int(float(parts[4]))
+                        elif token.startswith('zo,'):
+                            try: zone_depth_raw = int(float(token[3:]))
+                            except ValueError: pass
                         elif token.startswith('t2,'):
                             # 出口绊线已废弃：检测区域之外即出口，解析但忽略
                             self._log(f"忽略已废弃的出口绊线 t2: {token}")
 
+                    # 平移量的符号校正为"朝检测区侧"（算法与 C++ 构造器一致）。
+                    # 没有显式值时：新格式按默认 100，旧 t1 按 100 推断（板端也会这么做）。
+                    zone_depth = 0
+                    if zone_line:
+                        base = zone_depth_raw if zone_depth_raw is not None else ENTRY_MARKER_DEPTH
+                        zone_depth = _resolve_depth_sign(polys, zone_line, base)
+                        if zone_depth_raw is None:
+                            self._log(f"{'zin/zout' if zone_role else 't1'} 未给平移量，"
+                                      f"已按检测区方向推断为 {zone_depth:+.0f}px")
+                        elif abs(zone_depth - zone_depth_raw) >= 1:
+                            self._log(f"区域平移量 {zone_depth_raw:+d} 与检测区方向相反，"
+                                      f"已校正为 {zone_depth:+.0f}px")
                     self.cams.append({'ip':ip,'username':u,'password':pwd,'channel':ch,
                                       'resolution':res,'polygons':polys,
-                                      'entry_zone':entry,'exit_zone':None})
+                                      'zone_line':zone_line,'zone_role':zone_role,
+                                      'zone_depth':zone_depth,
+                                      'zone_depth_raw':zone_depth_raw})
         except Exception as e: QMessageBox.warning(self,"err",str(e)); return
         self.cam_lst.clear()
         for c in self.cams: self.cam_lst.addItem(f"{c['ip']}(Ch{c['channel']})")
@@ -747,8 +913,8 @@ class MainWindow(QMainWindow):
     def _sel_cam(self, item):
         i=self.cam_lst.row(item)
         if i<0: return
-        # 重复点同一个摄像头时不要清画布：否则刚画好、还没保存的区域/标记线会被悄悄清掉
-        keep = (i == self.cam_i) and (self.drawer.polygons or self.drawer.marker_line)
+        # 重复点同一个摄像头时不要清画布：否则刚画好、还没保存的区域/判定线会被悄悄清掉
+        keep = (i == self.cam_i) and (self.drawer.polygons or self.drawer.zone_line)
         self.cam_i=i; c=self.cams[i]
         self.ip_ed.setText(c['ip']); self.user_ed.setText(c['username'])
         self.pass_ed.setText(c['password']); self.ch_ed.setText(c['channel'])
@@ -760,16 +926,17 @@ class MainWindow(QMainWindow):
         self._apply_saved_geometry()
 
     def _apply_saved_geometry(self):
-        """把当前配置里的多边形/入口带加载进画布。
-        画布已有内容时不覆盖 —— 否则用户刚画好的区域/标记线会被悄悄清掉。"""
+        """把当前配置里的多边形/判定线加载进画布。
+        画布已有内容时不覆盖 —— 否则用户刚画好的区域/判定线会被悄悄清掉。"""
         if not (0 <= self.cam_i < len(self.cams)): return
         d = self.drawer
-        if d.frame is None or d.polygons or d.marker_line: return
+        if d.frame is None or d.polygons or d.zone_line: return
         c = self.cams[self.cam_i]
         try: w, h = map(int, c['resolution'].split('*'))
         except Exception: return
         d.set_polygons(c['polygons'], w, h)
-        d.set_zones(c.get('entry_zone'), c.get('exit_zone'), w, h)
+        d.set_zone(c.get('zone_line'), c.get('zone_role'),
+                   c.get('zone_depth') or 0, w, h)
 
     def _res_changed(self, text):
         """分辨率下拉改变 → 绘制坐标空间随之改变，把已有图形按比例换算过去，
@@ -834,8 +1001,12 @@ class MainWindow(QMainWindow):
         c=self.cams[self.cam_i]
         c['resolution']=self.res_cb.currentText()
         c['polygons']=self.drawer.polygons
-        c['entry_zone']=self.drawer.entry_zone
-        c['exit_zone']=self.drawer.exit_zone
+        c['zone_line']=self.drawer.zone_line
+        c['zone_role']=self.drawer.zone_role
+        c['zone_depth']=self.drawer.zone_depth
+        # 本相机新画了区域 → 平移量由画布决定；沿用原格式（t1 保持 t1，zin/zout 保持）
+        if self.drawer.zone_line:
+            c['zone_depth_raw'] = None if self.drawer.zone_role else self.drawer.zone_depth
         QMessageBox.information(self,"ok","已保存到内存")
 
     def _save(self):
@@ -851,17 +1022,30 @@ class MainWindow(QMainWindow):
                     xs = [pt[0] for pt in poly]; ys = [pt[1] for pt in poly]
                     if max(xs)==0 and max(ys)==0: continue
                     lp.append('['+' '.join(f"{x},{y}" for x,y in poly)+']')
-                # 入口绊线 4 点(入口带) -> 换算成 5 参格式 (绊线 + 带符号深度)
-                # 出口区域已删除：检测区域之外即出口，不再存储 t2。
-                ez = c.get('entry_zone')
-                if ez and len(ez) == 4:
-                    line, depth = _rect_to_line_depth(ez)
-                    if line and abs(depth) >= 1:
-                        lp.append(f"t1,{line[0][0]},{line[0][1]},{line[1][0]},{line[1][1]},{depth}")
-                    elif line:
-                        # depth≈0 表示入口带退化成一条线。写出去等于告诉板端"没有入口带"，
-                        # 会把 R1 区域悄悄删掉，所以宁可跳过并提示。
-                        self._log("警告: 入口带深度≈0，已跳过 t1（避免板端 R1 区域消失）")
+                # 判定线（区域边缘折线）+ 区域沿 x 的平移量。
+                #   新格式：zin,x1,y1,...,xN,yN  zo,<px>   —— 入口/出口由用户选择
+                #   旧格式：t1,x1,y1,x2,y2,<depth>          —— 2 点直线(向后兼容)
+                # 两种格式的 area 形状规则相同：判定线整体沿 x 平移 |平移量| px。
+                line = c.get('zone_line')
+                role = c.get('zone_role')
+                depth = c.get('zone_depth') or 0
+                if line and len(line) >= 2:
+                    if role in ('entry', 'exit'):
+                        token = 'zin' if role == 'entry' else 'zout'
+                        lp.append(token + ',' + ','.join(f"{x},{y}" for x, y in line))
+                        lp.append(f"zo,{int(round(depth))}")
+                    else:
+                        # 旧格式只存得下 2 点；点数更多的判定线自动升级成 zin/zout
+                        if len(line) == 2:
+                            raw = c.get('zone_depth_raw')
+                            if raw is None: raw = int(round(depth))
+                            lp.append(f"t1,{line[0][0]},{line[0][1]},"
+                                      f"{line[1][0]},{line[1][1]},{int(raw)}")
+                        else:
+                            lp.append('zin,' + ','.join(f"{x},{y}" for x, y in line))
+                            lp.append(f"zo,{int(round(depth))}")
+                            self._log(f"警告: {c['ip']} 的判定线有 {len(line)} 个顶点，"
+                                      f"旧格式 t1 存不下 → 已改写为 zin（请确认该相机是入口相机）")
                 f.write(' '.join(lp)+'\n')
         QMessageBox.information(self,"ok",f"已保存: {p}"); self.cfg_path=p
 

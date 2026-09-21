@@ -37,16 +37,49 @@ std::vector<CameraConfigEntry> parseCameraConfig(const std::string& configFile) 
         }
         
         size_t poly_start = (tokens.size() > 4 && tokens[4].find('*') != std::string::npos) ? 5 : 4;
+        bool zone_depth_explicit = false;   // 是否被 zo,/t1 显式给过平移量
         for (size_t i = poly_start; i < tokens.size(); i++) {
-            // 绊线: t1,x1,y1,x2,y2[,depth]（入口带基准线）
+            // 绊线: t1,x1,y1,x2,y2[,depth]（旧格式：2 点直线 + 沿 x 平移 |depth| px 的区域）
             if (tokens[i].rfind("t1,", 0) == 0) {
                 std::string body = tokens[i].substr(3);
                 std::replace(body.begin(), body.end(), ',', ' ');
                 std::istringstream ps(body);
                 float x1, y1, x2, y2, depth = 0;
                 ps >> x1 >> y1 >> x2 >> y2;
-                if (ps >> depth) config.entry_zone_depth = depth;
+                if (ps >> depth) { config.entry_zone_depth = depth; zone_depth_explicit = true; }
                 config.entry_line = Tripwire(x1, y1, x2, y2);
+            }
+            // 判定线 = 区域边缘折线（新格式，点数不限，边缘不一定是直线）：
+            //   zin,x1,y1,x2,y2[,...,xN,yN]  → 本相机画"入口区域"，角色 = 入口
+            //   zout,x1,y1,x2,y2[,...,xN,yN] → 本相机画"出口区域"，角色 = 出口
+            // 区域 = 该折线 ∪ 其沿 x 平移 |平移量| px（y 不变）的副本；折线本身就是判定线。
+            else if (tokens[i].rfind("zin,", 0) == 0 ||
+                     tokens[i].rfind("zout,", 0) == 0) {
+                const bool is_entry = (tokens[i].rfind("zin,", 0) == 0);
+                std::string body = tokens[i].substr(4);
+                std::replace(body.begin(), body.end(), ',', ' ');
+                std::istringstream ps(body);
+                std::vector<float> nums;
+                float v = 0.0f;
+                while (ps >> v) nums.push_back(v);
+                if (nums.size() < 4 || nums.size() % 2 != 0) {
+                    std::cerr << "[WARN] " << (is_entry ? "zin" : "zout")
+                              << " 判定线需要成对的顶点(≥2 点)，该行被忽略: "
+                              << tokens[i] << std::endl;
+                } else {
+                    config.zone_line.clear();
+                    for (size_t k = 0; k + 1 < nums.size(); k += 2)
+                        config.zone_line.emplace_back(nums[k], nums[k + 1]);
+                    config.zone_role = is_entry ? 0 : 1;   // 0=入口 1=出口
+                }
+            }
+            // 可选：单独指定区域沿 x 的平移量（仅影响区域显示/regionOf，不影响跨线判定）
+            else if (tokens[i].rfind("zo,", 0) == 0) {
+                try {
+                    const float px = std::stof(tokens[i].substr(3));
+                    config.entry_zone_depth = px;
+                    zone_depth_explicit = true;
+                } catch (...) {}
             }
             // 出口绊线 t2 已废弃：出口区域删除后"检测区域之外 = 出口"，
             // 这里保留对旧配置文件的兼容（解析但忽略），只提示一次。
@@ -94,6 +127,11 @@ std::vector<CameraConfigEntry> parseCameraConfig(const std::string& configFile) 
             }
         }
         
+        // 新格式(zin,/zout,)未显式给平移量时默认 100px（与工具端一致）。
+        // 符号由 GateIdCounter 构造器按检测区自校正（画反了自动翻转并告警）。
+        if (!config.zone_line.empty() && !zone_depth_explicit)
+            config.entry_zone_depth = 100.0f;
+
         // 保存掩膜预览
         cv::Mat mask = createDetectionMask(config.width, config.height, config.detection_zones);
         std::string safe_ip = config.ip;
