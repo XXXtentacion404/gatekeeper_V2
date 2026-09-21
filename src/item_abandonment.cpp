@@ -1,6 +1,14 @@
 // ============================================================================
 // 物品滞留检测实现（纯 CV 背景差分 · 不识别物品类别）
 // 详细设计与参数含义见 include/item_abandonment.h 与 文档/物品滞留检测_模块设计.md
+//
+// 三种检测模式（cfg_.mode）：
+//   DOUBLE_MOG2  : fg_long & ~fg_short                —— 抗光照，小目标弱，有吸收窗口上限
+//   REF_BG_DIFF  : |当前 - 空场景标准图| > 阈值        —— 导师"两输入"方案，小目标最敏感
+//   HYBRID(默认) : ref_mask & ~fg_short               —— 参考差分给灵敏度 + 短背景给"已静止"语义
+//
+// 检测区处理（cfg_.use_roi_crop）：只把检测区多边形的 bbox 送进差分并尽量保持 1:1 分辨率
+// （而不是把整帧缩到 960x540）—— 这是 8cm 小目标能不能做到的关键，能把目标像素数翻倍。
 // ============================================================================
 
 #include "item_abandonment.h"
@@ -50,6 +58,9 @@ static void mkdirP(const std::string& path) {
     }
 }
 
+// 形态学核边长强制为奇数（0 表示不用该操作）
+static int oddPx(int v) { return v <= 0 ? 0 : (v | 1); }
+
 // ==================== 构造 / 析构 ====================
 ItemAbandonmentDetector::ItemAbandonmentDetector(const AbandonConfig& cfg, std::string cam_id)
     : cfg_(cfg), cam_id_(std::move(cam_id)) {
@@ -59,52 +70,238 @@ ItemAbandonmentDetector::ItemAbandonmentDetector(const AbandonConfig& cfg, std::
     bg_long_  = cv::createBackgroundSubtractorMOG2(500, 16.0, false);
     bg_short_ = cv::createBackgroundSubtractorMOG2(60,  16.0, false);
 
-    // 形态学核：先开（去孤立噪点）后闭（补断裂）
-    kernel_open_  = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    kernel_close_ = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9));
+    // 形态学核：小目标必须用小核（5x5 开运算会把 8cm 细结构直接吃掉）
+    const int op = oddPx(cfg_.morph_open_px);
+    const int cl = oddPx(cfg_.morph_close_px);
+    if (op > 0) kernel_open_  = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(op, op));
+    if (cl > 0) kernel_close_ = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(cl, cl));
 
+    static const char* kModeName[] = {"DOUBLE_MOG2", "REF_BG_DIFF", "HYBRID"};
+    const int mi = clampi(cfg_.mode, 0, 2);
     std::cout << "[ITEM] " << cam_id_ << " 滞留检测器已创建: enable=" << (cfg_.enable ? 1 : 0)
-              << " work=" << cfg_.work_w << "x" << cfg_.work_h
+              << " mode=" << kModeName[mi]
+              << " ROI裁剪=" << (cfg_.use_roi_crop ? 1 : 0)
               << " sample_every=" << cfg_.sample_every
               << " min_item_px=" << cfg_.min_item_px
+              << " morph=" << op << "/" << cl
               << " remind=" << cfg_.remind_sec << "s push=" << cfg_.push_sec << "s"
-              << (cfg_.bg_seed_path.empty() ? "" : (" bg_seed=" + cfg_.bg_seed_path))
+              << (cfg_.ref_bg_path.empty() ? "" : (" ref_bg=" + cfg_.ref_bg_path))
               << std::endl;
-    if (cfg_.push_sec > 120.0)
+    if (mi != (int)AbandonMode::DOUBLE_MOG2 && cfg_.ref_bg_path.empty()) {
+        std::cerr << "[ITEM] " << cam_id_ << " ⚠️ mode=" << kModeName[mi]
+                  << " 但 ref_bg_path 为空 → 参考基线不可用，本相机将退回 DOUBLE_MOG2。"
+                     "请在 abandon_config.txt 填标准空场景背景图路径"
+                     "（或用 setRefBackground() 注入）。\n";
+    }
+    if (cfg_.push_sec > 120.0 && cfg_.mode == (int)AbandonMode::DOUBLE_MOG2)
         std::cout << "[ITEM] " << cam_id_
-                  << " 注意: push_sec=" << cfg_.push_sec
-                  << "s 较长。双背景的有效检测窗口上限 ≈ 1/bg_long_lr 个抽样帧"
+                  << " 注意: DOUBLE_MOG2 下 push_sec=" << cfg_.push_sec
+                  << "s 较长。有效检测窗口上限 ≈ 1/bg_long_lr 个抽样帧"
                      "（默认 0.002 × sample_every=4 @20FPS ≈ 100s）——超过后长背景也会把"
-                     "静止物吸收入背景，导致滞留物从 static_mask 消失。如需更长门槛，"
-                     "请同步调小 bg_long_lr。" << std::endl;
+                     "静止物吸收入背景，滞留物从 static_mask 消失。"
+                     "需要更长门槛请调小 bg_long_lr，或改用 REF_BG_DIFF/HYBRID 模式（无上限）。"
+                  << std::endl;
 }
 
 ItemAbandonmentDetector::~ItemAbandonmentDetector() = default;
 
-// ==================== 标准图初始化背景（导师"两输入"的输入①）====================
-void ItemAbandonmentDetector::seedBackgroundFromImage(const std::string& path) {
-    cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
+// ==================== 检测区 ROI 裁剪 ====================
+void ItemAbandonmentDetector::prepareRoi(const cv::Mat& region_mask) {
+    roi_ready_ = true;
+    if (!cfg_.use_roi_crop) {
+        roi_rect_ = cv::Rect(0, 0, full_w_, full_h_);
+        std::cout << "[ITEM] " << cam_id_ << " 检测区裁剪=关闭 → 处理整帧 "
+                  << full_w_ << "x" << full_h_ << std::endl;
+        return;
+    }
+    if (region_mask.empty()) {
+        roi_rect_ = cv::Rect(0, 0, full_w_, full_h_);
+        std::cout << "[ITEM] " << cam_id_ << " 无检测区掩膜 → 处理整帧" << std::endl;
+        return;
+    }
+    std::vector<cv::Point> nz;
+    cv::findNonZero(region_mask, nz);
+    if (nz.empty()) {
+        roi_rect_ = cv::Rect(0, 0, full_w_, full_h_);
+        return;
+    }
+    cv::Rect bb = cv::boundingRect(nz);
+    const int m = std::max(0, cfg_.roi_margin_px);
+    bb.x -= m; bb.y -= m; bb.width += 2 * m; bb.height += 2 * m;
+    bb &= cv::Rect(0, 0, full_w_, full_h_);
+    if (bb.width <= 0 || bb.height <= 0) bb = cv::Rect(0, 0, full_w_, full_h_);
+    roi_rect_ = bb;
+    std::cout << "[ITEM] " << cam_id_ << " 检测区 ROI 裁剪: " << bb.width << "x" << bb.height
+              << " @(" << bb.x << "," << bb.y << ")  占整帧 "
+              << (100.0 * bb.area() / ((double)full_w_ * full_h_)) << "%"
+              << " → 小目标可用像素数不变（不降采样）" << std::endl;
+}
+
+cv::Rect ItemAbandonmentDetector::toFull(const cv::Rect& r) const {
+    return cv::Rect(roi_rect_.x + (int)std::lround(r.x * inv_sx_),
+                    roi_rect_.y + (int)std::lround(r.y * inv_sy_),
+                    (int)std::lround(r.width * inv_sx_),
+                    (int)std::lround(r.height * inv_sy_));
+}
+cv::Point2f ItemAbandonmentDetector::toFull(const cv::Point2f& p) const {
+    return cv::Point2f((float)(roi_rect_.x + p.x * inv_sx_),
+                       (float)(roi_rect_.y + p.y * inv_sy_));
+}
+
+// ==================== 标准背景图（导师"两输入"的输入①）====================
+// 两条入口共用：seedFromRefImage()（读文件）与 setRefBackground()（外部注入）。
+bool ItemAbandonmentDetector::applyRefBackground(const cv::Mat& full_bgr) {
+    if (full_bgr.empty() || full_bgr.cols != full_w_ || full_bgr.rows != full_h_) return false;
+
+    // 与逐帧处理走完全相同的 ROI 裁剪 + 分辨率，保证像素级可比
+    cv::Mat roi_norm = full_bgr;
+    if (cfg_.use_roi_crop) {
+        cv::Rect r = roi_rect_ & cv::Rect(0, 0, full_bgr.cols, full_bgr.rows);
+        if (r.width > 0 && r.height > 0) roi_norm = full_bgr(r);
+    }
+    cv::Mat small = roi_norm, gray;
+    if (!gray_small_.empty() &&
+        (roi_norm.cols != gray_small_.cols || roi_norm.rows != gray_small_.rows)) {
+        cv::resize(roi_norm, small, gray_small_.size(), 0, 0, cv::INTER_AREA);
+    }
+    cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
+
+    ref_bg_gray_ = gray.clone();     // 参考差分基线
+    ref_bg_ready_ = true;
+
+    // 同时把 MOG2 直接设成这张背景 → 免 warmup，开机即检测。
+    // ⚠️ MOG2::apply 只有 (image, fgmask, learningRate) 一个重载，learningRate 不能省掉
+    //    fgmask 参数（写 apply(gray, 1.0) 会把 1.0 当 OutputArray 而编译失败）。
+    cv::Mat dummy;
+    for (int i = 0; i < 3; ++i) {
+        bg_long_->apply(ref_bg_gray_, dummy, 1.0);
+        bg_short_->apply(ref_bg_gray_, dummy, 1.0);
+    }
+    bg_seeded_ = true;
+    return true;
+}
+
+bool ItemAbandonmentDetector::setRefBackground(const cv::Mat& full_bgr) {
+    if (full_bgr.empty()) return false;
+    if (full_w_ <= 0) {                 // 还没跑过 update() → 先建立尺寸与 ROI（整帧）
+        full_w_ = full_bgr.cols;
+        full_h_ = full_bgr.rows;
+        if (!roi_ready_) prepareRoi(cv::Mat());
+    }
+    if (!applyRefBackground(full_bgr)) return false;
+    std::cout << "[ITEM] " << cam_id_ << " 已注入标准背景图 → 参考差分基线就绪("
+              << ref_bg_gray_.cols << "x" << ref_bg_gray_.rows << ")，跳过 warmup" << std::endl;
+    return true;
+}
+
+void ItemAbandonmentDetector::seedFromRefImage() {
+    if (cfg_.ref_bg_path.empty()) return;   // 走 MOG2 warmup 冷启动
+
+    cv::Mat img = cv::imread(cfg_.ref_bg_path, cv::IMREAD_COLOR);
     if (img.empty()) {
-        std::cerr << "[ITEM] " << cam_id_ << " 背景标准图读取失败: " << path
-                  << " → 回退到 warmup 冷启动（warmup_frames=" << cfg_.warmup_frames << "）"
+        std::cerr << "[ITEM] " << cam_id_ << " 背景标准图读取失败: " << cfg_.ref_bg_path
+                  << " → 退回 DOUBLE_MOG2 冷启动（warmup_frames=" << cfg_.warmup_frames << "）"
                   << std::endl;
         return;
     }
-    cv::Size ws(cfg_.work_w > 0 ? cfg_.work_w : 960, cfg_.work_h > 0 ? cfg_.work_h : 540);
-    cv::Mat small, gray;
-    cv::resize(img, small, ws, 0, 0, cv::INTER_AREA);
-    cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
-    // learningRate=1.0 → 直接把当前帧写成背景模型（完全替换），连喂几次更稳
-    // ⚠️ MOG2::apply 只有 (image, fgmask, learningRate) 一个重载，learningRate 不能省掉
-    //     fgmask 参数（写 apply(gray, 1.0) 会把 1.0 当 OutputArray 而编译失败）。
-    cv::Mat dummy_mask;
-    for (int i = 0; i < 3; ++i) {
-        bg_long_->apply(gray, dummy_mask, 1.0);
-        bg_short_->apply(gray, dummy_mask, 1.0);
+    if (img.cols != full_w_ || img.rows != full_h_) {
+        std::cout << "[ITEM] " << cam_id_ << " 标准图尺寸 " << img.cols << "x" << img.rows
+                  << " 与视频 " << full_w_ << "x" << full_h_ << " 不一致 → 已缩放对齐" << std::endl;
+        cv::Mat tmp;
+        cv::resize(img, tmp, cv::Size(full_w_, full_h_), 0, 0, cv::INTER_AREA);
+        img = tmp;
     }
-    bg_seeded_ = true;
-    std::cout << "[ITEM] " << cam_id_ << " 已用标准图 seed 背景: " << path
-              << " → 跳过 warmup（" << gray.cols << "x" << gray.rows << "）" << std::endl;
+    if (!applyRefBackground(img)) {
+        std::cerr << "[ITEM] " << cam_id_ << " 标准背景图应用失败" << std::endl;
+        return;
+    }
+    std::cout << "[ITEM] " << cam_id_ << " 已载入标准背景图 → 参考差分基线就绪("
+              << ref_bg_gray_.cols << "x" << ref_bg_gray_.rows << ")，跳过 warmup" << std::endl;
+}
+
+// 光照/场景突变时刷新参考基线
+void ItemAbandonmentDetector::refreshRefBg(const cv::Mat& gray) {
+    ref_bg_gray_ = gray.clone();
+    ref_bg_ready_ = true;
+    std::cerr << "[ITEM] " << cam_id_ << " ⚠️ 连续 " << cfg_.ref_light_change_frames
+              << " 帧大面积变化（光照/相机变动）→ 已用当前帧刷新参考背景。"
+                 "注意：若此刻画面里确有滞留物，它会被写进基线、之后不再告警。\n";
+}
+
+// ==================== 按模式生成 static mask ====================
+void ItemAbandonmentDetector::buildStaticMask() {
+    const int mode = clampi(cfg_.mode, 0, 2);
+
+    // MOG2 始终喂：DOUBLE_MOG2 靠它取前景；REF/HYBRID 靠它的短背景提供"已静止"语义
+    bg_long_->apply(gray_small_, fg_long_, cfg_.bg_long_lr);
+    bg_short_->apply(gray_small_, fg_short_, cfg_.bg_short_lr);
+
+    if (mode == (int)AbandonMode::DOUBLE_MOG2) {
+        cv::Mat not_short;
+        cv::bitwise_not(fg_short_, not_short);
+        cv::bitwise_and(fg_long_, not_short, mask_combined_);
+    } else {
+        if (!ref_bg_ready_ || ref_bg_gray_.size() != gray_small_.size()) {
+            mask_combined_.create(gray_small_.size(), CV_8UC1);
+            mask_combined_.setTo(0);
+            return;
+        }
+        // 参考背景差分：|当前 − 空场景标准图| > 固定阈值（阈值可压得很低 → 抓得住 8cm）
+        cv::absdiff(gray_small_, ref_bg_gray_, diff_buf_);
+        cv::threshold(diff_buf_, ref_mask_, cfg_.ref_diff_thresh, 255, cv::THRESH_BINARY);
+        if (mode == (int)AbandonMode::REF_BG_DIFF) {
+            ref_mask_.copyTo(mask_combined_);
+        } else {
+            // HYBRID：参考差分给灵敏度；~fg_short 给"静止下来"语义（压掉走动的人/还在动的物体）
+            cv::Mat not_short;
+            cv::bitwise_not(fg_short_, not_short);
+            cv::bitwise_and(ref_mask_, not_short, mask_combined_);
+        }
+    }
+
+    if (!kernel_open_.empty())
+        cv::morphologyEx(mask_combined_, mask_combined_, cv::MORPH_OPEN, kernel_open_);
+    if (!kernel_close_.empty())
+        cv::morphologyEx(mask_combined_, mask_combined_, cv::MORPH_CLOSE, kernel_close_);
+}
+
+// ==================== 标定自检 ====================
+void ItemAbandonmentDetector::printCalibration() const {
+    if (roi_rect_.width <= 0 || gray_small_.empty()) return;
+    const double src_w = cfg_.use_roi_crop ? (double)roi_rect_.width : (double)full_w_;
+    const double zoom = gray_small_.cols / std::max(1.0, src_w);
+    std::cout << "[ITEM] " << cam_id_ << " 标定自检: ROI " << roi_rect_.width << "x" << roi_rect_.height
+              << "px → 处理图 " << gray_small_.cols << "x" << gray_small_.rows
+              << "px (缩放 " << zoom << "x)" << std::endl;
+
+    if (cfg_.region_width_cm <= 0) {
+        std::cout << "[ITEM]   未填 region_width_cm → 无法自动校核 8cm。现场做法：在检测区放"
+                     "已知尺寸物体（A4 纸横放 29.7cm），量它在**处理图**里的像素宽，"
+                     "px_per_cm = 像素宽/29.7，则 8cm ≈ 8×px_per_cm。\n";
+        return;
+    }
+    const double px_per_cm = gray_small_.cols / cfg_.region_width_cm;
+    const double px8 = 8.0 * px_per_cm;
+    const double min_cm = cfg_.min_item_px / px_per_cm;
+    std::cout << "[ITEM]   检测区宽 " << cfg_.region_width_cm << "cm → px_per_cm=" << px_per_cm
+              << " → 8cm ≈ " << px8 << "px;  min_item_px=" << cfg_.min_item_px
+              << " 相当于 " << min_cm << "cm";
+    if (cfg_.min_item_px > px8) {
+        std::cout << "  ⚠️ 比 8cm 大 → 8cm 目标会被尺寸门限滤掉！建议 min_item_px ≤ "
+                  << (int)px8;
+    } else {
+        std::cout << "  ✓ 满足 8cm 指标";
+    }
+    std::cout << std::endl;
+    if (px8 < 15.0) {
+        std::cout << "[ITEM]   ⚠️ 8cm 仅 " << px8
+                  << "px (<15px)：纯 CV 可靠检测困难。可提高 work_max_w（减少降采样）、"
+                     "缩小检测区视野/把相机装近，或换更高分辨率相机。\n";
+    } else if (px8 < 20.0) {
+        std::cout << "[ITEM]   ⚠️ 8cm 约 " << px8
+                  << "px (15~20px)：勉强可检测，建议 morph_open_px=0 并适当降低 "
+                     "ref_diff_thresh（如 15~20）。\n";
+    }
 }
 
 // ==================== 主入口 ====================
@@ -130,59 +327,95 @@ std::vector<ItemEvent> ItemAbandonmentDetector::update(const cv::Mat& full_frame
 
     full_w_ = full_frame.cols;
     full_h_ = full_frame.rows;
-    const int ww = cfg_.work_w > 0 ? cfg_.work_w : full_w_;
-    const int wh = cfg_.work_h > 0 ? cfg_.work_h : full_h_;
-    scale_x_ = (double)full_w_ / ww;   // 全分辨率 = 工作分辨率 × scale
-    scale_y_ = (double)full_h_ / wh;
     const int64_t now_ms = capture_ms;
 
-    // ---- 1) 预处理：降采样 + 灰度（先缩后转灰度，比先转灰度再缩更省）----
-    cv::resize(full_frame, gray_small_, cv::Size(ww, wh), 0, 0, cv::INTER_AREA);
-    cv::cvtColor(gray_small_, gray_small_, cv::COLOR_BGR2GRAY);
+    // ---- 1) 检测区 ROI（只算一次，掩膜是固定的）----
+    if (!roi_ready_) prepareRoi(region_mask);
+    cv::Rect roi = roi_rect_;
+    if (roi.width <= 0 || roi.height <= 0 || roi.x + roi.width > full_w_ ||
+        roi.y + roi.height > full_h_) {
+        roi = cv::Rect(0, 0, full_w_, full_h_);
+    }
 
-    // ---- 2) 冷启动 / 标准图 seed ----
+    // ---- 2) 裁 ROI → 灰度（尽量 1:1，不损失小目标像素）----
+    if (cfg_.use_roi_crop) {
+        const cv::Mat roi_src = full_frame(roi);
+        double s = 1.0;
+        if (cfg_.work_max_w > 0 && roi.width > cfg_.work_max_w)
+            s = (double)cfg_.work_max_w / roi.width;
+        if (s < 0.999) {
+            cv::resize(roi_src, small_color_,
+                       cv::Size(std::max(1, (int)std::lround(roi.width * s)),
+                                std::max(1, (int)std::lround(roi.height * s))),
+                       0, 0, cv::INTER_AREA);
+        } else {
+            small_color_ = roi_src;   // 浅拷贝，只读
+        }
+        inv_sx_ = inv_sy_ = 1.0 / s;
+    } else {
+        const int ww = cfg_.work_w > 0 ? cfg_.work_w : full_w_;
+        const int wh = cfg_.work_h > 0 ? cfg_.work_h : full_h_;
+        cv::resize(full_frame, small_color_, cv::Size(ww, wh), 0, 0, cv::INTER_AREA);
+        inv_sx_ = (double)full_w_ / ww;
+        inv_sy_ = (double)full_h_ / wh;
+    }
+    cv::cvtColor(small_color_, gray_small_, cv::COLOR_BGR2GRAY);
+
+    // ---- 3) 标准图 seed / 冷启动 ----
     if (!seed_tried_) {
         seed_tried_ = true;
-        if (!cfg_.bg_seed_path.empty()) seedBackgroundFromImage(cfg_.bg_seed_path);
+        seedFromRefImage();
+        // 参考模式若拿不到基线，mask 会恒为 0（静默不工作）—— 必须明确退回，不能沉默失败。
+        if (clampi(cfg_.mode, 0, 2) != (int)AbandonMode::DOUBLE_MOG2 && !ref_bg_ready_) {
+            std::cerr << "[ITEM] " << cam_id_
+                      << " 参考背景基线不可用 → 本相机退回 DOUBLE_MOG2 冷启动\n";
+            cfg_.mode = (int)AbandonMode::DOUBLE_MOG2;
+        }
+    }
+    if (!calib_printed_) {
+        printCalibration();
+        calib_printed_ = true;
     }
     ++frame_count_;
     const bool warming = (!bg_seeded_ && frame_count_ <= cfg_.warmup_frames);
 
-    // ---- 3) 双背景 → 静态前景掩膜 ----
-    // fg_long ：慢背景的前景（lr 小 → 新静止物长期留作前景）
-    // fg_short：快背景的前景（lr 大 → 几秒内吸收静止物）
-    // static_mask = fg_long AND NOT fg_short → 只留"静止下来的新物体"
-    // ⚠️ 有效窗口 = [短背景吸收(≈1/bg_short_lr 帧), 长背景吸收(≈1/bg_long_lr 帧)]。
-    //    默认 0.002/0.05 @ sample_every=4 → 约 [4s, 100s]，覆盖默认 60s 门槛。
-    bg_long_->apply(gray_small_, fg_long_, cfg_.bg_long_lr);
-    bg_short_->apply(gray_small_, fg_short_, cfg_.bg_short_lr);
-    if (warming) return ev;
+    // ---- 4) 生成 static mask（内部同时喂两个 MOG2）----
+    buildStaticMask();
+    if (warming) return ev;   // 冷启动期只喂背景，不检测
 
-    cv::Mat not_short;
-    cv::bitwise_not(fg_short_, not_short);
-    cv::bitwise_and(fg_long_, not_short, mask_combined_);
-    cv::morphologyEx(mask_combined_, mask_combined_, cv::MORPH_OPEN, kernel_open_);
-    cv::morphologyEx(mask_combined_, mask_combined_, cv::MORPH_CLOSE, kernel_close_);
+    // ---- 5) 光照/场景突变守卫（参考差分专用）----
+    if (clampi(cfg_.mode, 0, 2) != (int)AbandonMode::DOUBLE_MOG2 && !ref_mask_.empty()) {
+        const double ratio =
+            (double)cv::countNonZero(ref_mask_) / (double)ref_mask_.total();
+        if (ratio > cfg_.ref_light_change_ratio) {
+            if (++light_change_streak_ >= std::max(1, cfg_.ref_light_change_frames)) {
+                refreshRefBg(gray_small_);   // 连续多帧大面积变化 = 光照/相机变了
+                light_change_streak_ = 0;
+            }
+            return ev;   // 本帧不出候选（避免整片误报）
+        }
+        light_change_streak_ = 0;
+    }
 
-    // ---- 4) 连通域 + 过滤 → 候选静止块 ----
+    // ---- 6) 连通域 + 过滤 → 候选静止块 ----
     std::vector<cv::Rect> blobs;
     std::vector<cv::Point2f> centroids;
     std::vector<int> areas;
     extractStaticBlobs(person_tracks, region_mask, blobs, centroids, areas);
 
-    // ---- 5) 块关联到已有轨迹（贪心最近质心）----
+    // ---- 7) 块关联到已有轨迹（贪心最近质心）----
     associateAndUpdate(blobs, centroids, areas, now_ms, ev);
 
-    // ---- 6) 人-物绑定（用现有 person 框）----
+    // ---- 8) 人-物绑定（用现有 person 框）----
     bindOwners(person_tracks, full_frame, now_ms, ev);
 
-    // ---- 7) 状态推进（阈值用"无人关联静止时长"）----
+    // ---- 9) 状态推进（阈值用"无人关联静止时长"）----
     advanceState(now_ms, ev);
 
     return ev;
 }
 
-// ==================== 4) 候选静止块提取 ====================
+// ==================== 候选静止块提取 ====================
 void ItemAbandonmentDetector::extractStaticBlobs(const std::vector<TrackedObject>& persons,
                                                  const cv::Mat& region_mask,
                                                  std::vector<cv::Rect>& out_blobs,
@@ -196,15 +429,11 @@ void ItemAbandonmentDetector::extractStaticBlobs(const std::vector<TrackedObject
 
     const double full_area = (double)full_w_ * (double)full_h_;
     for (const auto& c : contours) {
-        // 面积：工作分辨率 → 全分辨率口径，保证与配置的 min_item_area 同一量纲
-        const double area_full = cv::contourArea(c) * scale_x_ * scale_y_;
+        // 面积按全分辨率口径换算，保证与配置的 min_item_area 同一量纲
+        const double area_full = cv::contourArea(c) * inv_sx_ * inv_sy_;
         if (area_full < cfg_.min_item_area) continue;
 
-        const cv::Rect bw = cv::boundingRect(c);
-        cv::Rect bf((int)std::lround(bw.x * scale_x_),
-                    (int)std::lround(bw.y * scale_y_),
-                    (int)std::lround(bw.width * scale_x_),
-                    (int)std::lround(bw.height * scale_y_));
+        cv::Rect bf = toFull(cv::boundingRect(c));
         bf &= cv::Rect(0, 0, full_w_, full_h_);
         if (bf.width <= 0 || bf.height <= 0) continue;
         // 最小边长（8cm 门限的像素口径）
@@ -214,14 +443,14 @@ void ItemAbandonmentDetector::extractStaticBlobs(const std::vector<TrackedObject
 
         const cv::Point2f cen(bf.x + bf.width * 0.5f, bf.y + bf.height * 0.5f);
 
-        // 只检监控区域（ROI 为空 = 不限制）
+        // ROI 是矩形 bbox，检测区是多边形：矩形内仍可能有区外部分，用掩膜做精确判定
         if (!region_mask.empty()) {
             const int cx = clampi((int)cen.x, 0, region_mask.cols - 1);
             const int cy = clampi((int)cen.y, 0, region_mask.rows - 1);
             if (region_mask.at<uchar>(cy, cx) == 0) continue;
         }
 
-        // 排除"站着不动的人"：长背景里同样把静止的人判成新前景块
+        // 排除"站着不动的人"：参考差分同样会把静止的人判成新前景块
         if (overlapsPerson(bf, persons)) continue;
 
         out_blobs.push_back(bf);
@@ -230,7 +459,7 @@ void ItemAbandonmentDetector::extractStaticBlobs(const std::vector<TrackedObject
     }
 }
 
-// ==================== 5) 关联 + 移动重置 + 拾取清除 ====================
+// ==================== 关联 + 移动重置 + 拾取清除 ====================
 void ItemAbandonmentDetector::associateAndUpdate(const std::vector<cv::Rect>& blobs,
                                                  const std::vector<cv::Point2f>& centroids,
                                                  const std::vector<int>& /*areas*/,
@@ -269,14 +498,13 @@ void ItemAbandonmentDetector::associateAndUpdate(const std::vector<cv::Rect>& bl
         const int b = item2blob[k];
         const double disp = dist(centroids[b], it.centroid);
 
-        // 平滑（质心 + 框各分量）
         it.centroid.x += (centroids[b].x - it.centroid.x) * a;
         it.centroid.y += (centroids[b].y - it.centroid.y) * a;
-        const cv::Rect& nb_box = blobs[b];
-        it.box.x      = (int)std::lround(it.box.x      + (nb_box.x      - it.box.x)      * a);
-        it.box.y      = (int)std::lround(it.box.y      + (nb_box.y      - it.box.y)      * a);
-        it.box.width  = (int)std::lround(it.box.width  + (nb_box.width  - it.box.width)  * a);
-        it.box.height = (int)std::lround(it.box.height + (nb_box.height - it.box.height) * a);
+        const cv::Rect& nbb = blobs[b];
+        it.box.x      = (int)std::lround(it.box.x      + (nbb.x      - it.box.x)      * a);
+        it.box.y      = (int)std::lround(it.box.y      + (nbb.y      - it.box.y)      * a);
+        it.box.width  = (int)std::lround(it.box.width  + (nbb.width  - it.box.width)  * a);
+        it.box.height = (int)std::lround(it.box.height + (nbb.height - it.box.height) * a);
         if (it.box.width <= 0)  it.box.width = 1;
         if (it.box.height <= 0) it.box.height = 1;
 
@@ -323,14 +551,14 @@ void ItemAbandonmentDetector::associateAndUpdate(const std::vector<cv::Rect>& bl
         it.first_seen_ms = now_ms;
         it.last_seen_ms = now_ms;
         it.static_since_ms = now_ms;
-        // 新块先按"无人关联"起算；若旁边有人，bindOwners 会在本帧立刻把它清零
+        // 新块先按"无人关联"起算；若旁边有人，bindOwners 会在本帧立刻清零
         it.unattended_since_ms = now_ms;
         items_.push_back(it);
     }
 
     // ---- 未匹配的轨迹 → 连续丢失超限 = 被拾取/移出 ----
-    // 用重建法而不是边遍历边 erase：本函数前面刚 push 过新轨迹，items_ 与 item2blob 长度
-    // 已不对齐，原地 erase 会让所有后续下标错位（历史踩坑）。
+    // 用重建法而不是边遍历边 erase：上面刚 push 过新轨迹，items_ 与 item2blob 长度
+    // 已不对齐，原地 erase 会让后续下标全部错位（历史踩坑）。
     {
         std::vector<ItemTrack> kept;
         kept.reserve(items_.size());
@@ -360,13 +588,13 @@ void ItemAbandonmentDetector::associateAndUpdate(const std::vector<cv::Rect>& bl
     }
 }
 
-// ==================== 6) 人-物绑定 ====================
+// ==================== 人-物绑定 ====================
 void ItemAbandonmentDetector::bindOwners(const std::vector<TrackedObject>& persons,
                                          const cv::Mat& full_frame,
                                          int64_t now_ms,
                                          std::vector<ItemEvent>& ev) {
     for (auto& it : items_) {
-        // 找最近的人（用人物框中心 ↔ 物品质心）
+        // 找最近的人（人物框中心 ↔ 物品质心）
         const TrackedObject* best = nullptr;
         double best_d = 1e18;
         for (const auto& p : persons) {
@@ -413,7 +641,7 @@ void ItemAbandonmentDetector::bindOwners(const std::vector<TrackedObject>& perso
     }
 }
 
-// ==================== 7) 状态推进 ====================
+// ==================== 状态推进 ====================
 void ItemAbandonmentDetector::advanceState(int64_t now_ms, std::vector<ItemEvent>& ev) {
     for (auto& it : items_) {
         if (it.unattended_since_ms == 0) {   // 有人看管中
@@ -547,12 +775,27 @@ bool applyAbandonKV(AbandonConfig& c, const std::string& key, const std::string&
     auto b = [&]() { return !(val == "0" || val == "false" || val == "no" || val == "off"); };
 
     if (key == "enable")            c.enable = b();
+    else if (key == "mode") {
+        if (val == "mog2" || val == "double_mog2" || val == "0")      c.mode = 0;
+        else if (val == "ref" || val == "ref_bg_diff" || val == "1")  c.mode = 1;
+        else if (val == "hybrid" || val == "2")                       c.mode = 2;
+    }
+    // bg_seed_path 是旧名，等价于 ref_bg_path（兼容老配置）
+    else if (key == "ref_bg_path" || key == "bg_seed_path") c.ref_bg_path = val;
+    else if (key == "use_roi_crop")  c.use_roi_crop = i(c.use_roi_crop);
+    else if (key == "roi_margin_px") c.roi_margin_px = i(c.roi_margin_px);
+    else if (key == "work_max_w")    c.work_max_w = i(c.work_max_w);
+    else if (key == "ref_diff_thresh") c.ref_diff_thresh = d(c.ref_diff_thresh);
+    else if (key == "ref_light_change_ratio") c.ref_light_change_ratio = d(c.ref_light_change_ratio);
+    else if (key == "ref_light_change_frames") c.ref_light_change_frames = i(c.ref_light_change_frames);
+    else if (key == "morph_open_px")  c.morph_open_px = i(c.morph_open_px);
+    else if (key == "morph_close_px") c.morph_close_px = i(c.morph_close_px);
+    else if (key == "region_width_cm") c.region_width_cm = d(c.region_width_cm);
     else if (key == "work_w")       c.work_w = i(c.work_w);
     else if (key == "work_h")       c.work_h = i(c.work_h);
     else if (key == "warmup_frames")c.warmup_frames = i(c.warmup_frames);
     else if (key == "sample_every") c.sample_every = i(c.sample_every);
     else if (key == "use_own_thread") c.use_own_thread = b();
-    else if (key == "bg_seed_path") c.bg_seed_path = val;
     else if (key == "bg_long_lr")   c.bg_long_lr = d(c.bg_long_lr);
     else if (key == "bg_short_lr")  c.bg_short_lr = d(c.bg_short_lr);
     else if (key == "min_item_px")  c.min_item_px = i(c.min_item_px);
@@ -606,9 +849,10 @@ AbandonConfig loadAbandonConfig(const std::string& path, int role) {
     }
     for (const auto& kv : role_kv) applyAbandonKV(c, kv.first, kv.second);
 
+    static const char* kModeName[] = {"DOUBLE_MOG2", "REF_BG_DIFF", "HYBRID"};
     std::cout << "[ITEM] " << path << " 已加载 (role=" << role << "): enable=" << (c.enable ? 1 : 0)
-              << " work=" << c.work_w << "x" << c.work_h
-              << " sample_every=" << c.sample_every
+              << " mode=" << kModeName[clampi(c.mode, 0, 2)]
+              << " roi_crop=" << c.use_roi_crop
               << " min_item_px=" << c.min_item_px << " min_area=" << c.min_item_area
               << " remind=" << c.remind_sec << "s push=" << c.push_sec << "s"
               << " save_dir=" << c.save_dir << std::endl;

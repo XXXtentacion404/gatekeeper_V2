@@ -29,19 +29,53 @@
 
 #include "bytetrack/tracker.h"   // TrackedObject
 
+// ==================== 检测模式 ====================
+// 决定「什么算滞留物」的取前景方式：
+enum class AbandonMode {
+    DOUBLE_MOG2 = 0,  // 双自适应背景（抗光照强、小目标弱；有 ≈1/bg_long_lr 吸收窗口上限）
+    REF_BG_DIFF = 1,  // ★ 参考背景差分（导师"两输入"方案）：|当前帧 − 空场景背景| > 阈值。
+                      //   对小目标最敏感（阈值可压到 15 灰阶），但光照变化/常驻新物会误报。
+    HYBRID      = 2,  // ★ 推荐 = 参考差分 & 短背景非前景 = ref_mask & ~fg_short：
+                      //   参考差分给「灵敏度」（抓得住 8cm）+ 短背景给「已静止」语义
+                      //   （压掉走动的人、刚出现还在动的物体）+ 光照突变守卫。
+};
+
 // ==================== 配置 ====================
 struct AbandonConfig {
     bool enable = true;
 
-    // —— 背景差分工作分辨率（越小越快，越小目标越糊）——
+    // —— 检测模式 ——
+    int mode = 2;                 // AbandonMode，默认 HYBRID
+    std::string ref_bg_path = ""; // 标准空场景背景图（画面里没有任何滞留物）。
+                                  // 既是参考差分的基线，也用来 seed 双 MOG2（免 warmup）。
+                                  // 留空 → 自动退回 DOUBLE_MOG2 冷启动。
+
+    // —— 检测区裁剪（★ 8cm 小目标的关键：只处理检测区，保持 1:1 不降采样）——
+    int  use_roi_crop   = 1;      // 1 = 只把检测区多边形的 bbox 送进差分（而不是整帧缩放）
+    int  roi_margin_px  = 24;     // 裁剪时四周留边
+    int  work_max_w     = 1280;   // 裁剪后宽度超此值才降采样（0 = 永不降采样）
+
+    // —— 参考差分参数（REF_BG_DIFF / HYBRID）——
+    double ref_diff_thresh = 25.0;        // 固定灰度差分阈值：越小越敏感。8cm 建议 15~25
+    double ref_light_change_ratio = 0.25; // 差分前景占比 > 此值 → 判为光照/场景突变
+    int    ref_light_change_frames = 3;   // 连续 N 帧突变 → 用当前帧自动刷新参考背景
+
+    // —— 工作分辨率（ROI 超限降采样 / 整帧模式用）——
     int work_w = 960;
     int work_h = 540;
     int warmup_frames = 60;   // 前 N 个抽样帧只喂背景模型，不检测（避免冷启动全屏前景）
     int sample_every = 4;     // 抽样帧间隔：每 N 帧跑一次背景差分（省 CPU）
     bool use_own_thread = false;  // 预留：独立线程模式。当前实现为同步抽样调用
                                   // （sample_every 已把开销压到 ~4%，无需线程）。
-    std::string bg_seed_path = "";  // 可选：标准空场景背景图路径，直接 seed 长期背景
-                                    //       → 免 warmup（对应导师"两输入"里的输入①）
+
+    // —— 形态学（小目标关键：开运算会吃掉细结构）——
+    int morph_open_px  = 3;   // 开运算核边长，0 = 不做开运算（目标 <20px 建议 0 或 3）
+    int morph_close_px = 5;   // 闭运算核边长（补小目标断裂）
+
+    // —— 标定辅助 ——
+    double region_width_cm = 0;  // 检测区横向实际宽度(cm)，0 = 未知。
+                                 // 填了就在启动时打印 px_per_cm、8cm 对应像素、
+                                 // 以及当前 min_item_px 折算成多少 cm（校核是否满足 8cm 指标）
 
     // —— 双背景学习率 ——
     double bg_long_lr = 0.002;   // 慢：把"新静止物"长期留作前景
@@ -169,9 +203,13 @@ public:
                                   int64_t capture_ms,
                                   int result_frame_id);
 
+    // 直接注入标准背景图（**全分辨率 BGR**），内部走与 ref_bg_path 完全相同的
+    // ROI 裁剪 + 灰度 + seed MOG2 路径。主要给单元测试和离线调参工具用；
+    // 生产路径请用 cfg.ref_bg_path。返回 false = 尺寸不符或为空。
+    bool setRefBackground(const cv::Mat& full_bgr);
+
     // —— 供显示 / 统计 ——
-    const std::vector<ItemTrack>& items() const { return items_; }
-    int alarmCount() const;                 // 处于告警态(L1/L2)的滞留物数
+    const std::vector<ItemTrack>& items() const { return items_; }    int alarmCount() const;                 // 处于告警态(L1/L2)的滞留物数
     int level1Count() const;                // L1 数量
     int level2Count() const;                // L2 数量
     bool warmupDone() const { return frame_count_ >= cfg_.warmup_frames; }
@@ -180,8 +218,19 @@ public:
     const AbandonConfig& config() const { return cfg_; }
 
 private:
-    // —— 内部步骤 ——
-    void seedBackgroundFromImage(const std::string& path);
+    // —— 几何：检测区 ROI 裁剪 ——
+    void prepareRoi(const cv::Mat& region_mask);      // 首次调用时算检测区 bbox
+    cv::Rect    toFull(const cv::Rect& r) const;      // 处理分辨率 → 全分辨率
+    cv::Point2f toFull(const cv::Point2f& p) const;
+
+    // —— 背景 / 前景 ——
+    void seedFromRefImage();                  // 用 ref_bg_path 建立参考基线 + seed MOG2
+    bool applyRefBackground(const cv::Mat& full_bgr);  // 裁 ROI→灰度→基线+seed（两条入口共用）
+    void buildStaticMask();                   // 按 cfg_.mode 生成 mask_combined_
+    void refreshRefBg(const cv::Mat& gray);   // 光照/场景突变时用当前帧刷新参考背景
+    void printCalibration() const;            // px_per_cm、8cm 像素、min_item_px 校核
+
+    // —— 逐帧步骤 ——
     void extractStaticBlobs(const std::vector<TrackedObject>& persons,
                             const cv::Mat& region_mask,
                             std::vector<cv::Rect>& out_blobs,
@@ -214,17 +263,26 @@ private:
     int   frame_count_ = 0;     // 实际跑过差分的帧数（warmup 判定用）
     int   next_item_id_ = 1;
     int   last_result_frame_id_ = -1;
-    int64_t seq_ = 0;           // 证据目录序号
 
     std::vector<ItemTrack> items_;
 
-    // 复用缓冲，避免每帧分配
+    // —— 检测区 ROI 裁剪几何 ——
+    bool     roi_ready_ = false;
+    cv::Rect roi_rect_{0, 0, 0, 0};   // 检测区 bbox（全分辨率坐标）
+    double   inv_sx_ = 1.0, inv_sy_ = 1.0;   // 处理分辨率 → 全分辨率 的倍数（1.0 = 未降采样）
+    int      full_w_ = 0, full_h_ = 0;
+
+    // —— 背景模型状态 ——
+    bool  seed_tried_ = false;
+    bool  bg_seeded_   = false;   // MOG2 已由标准图建立 → 跳过 warmup
+    bool  ref_bg_ready_ = false;  // 参考差分基线就绪
+    int   light_change_streak_ = 0;
+    bool  calib_printed_ = false;
+
+    // —— 复用缓冲，避免每帧分配 ——
     cv::Mat gray_small_, fg_long_, fg_short_, mask_combined_;
+    cv::Mat ref_bg_gray_, ref_mask_, diff_buf_, small_color_;
     cv::Mat kernel_open_, kernel_close_;
-    double  scale_x_ = 1.0, scale_y_ = 1.0;   // 全分辨率 → 工作分辨率
-    int     full_w_ = 0, full_h_ = 0;         // 最近一帧的全分辨率尺寸
-    bool    seed_tried_ = false;              // 是否已尝试过 bg_seed_path
-    bool    bg_seeded_ = false;               // 背景是否已由标准图建立（可跳过 warmup）
 };
 
 // ==================== 配置加载 ====================
