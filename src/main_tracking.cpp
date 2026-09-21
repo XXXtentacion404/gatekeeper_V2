@@ -35,6 +35,7 @@
 #include "yolov8_thread_pool.h"
 #include "bytetrack/tracker.h"
 #include "gate_id_counter.h"
+#include "item_abandonment.h"
 #include "mask_utils.h"
 #include "comm.h"
 
@@ -112,6 +113,13 @@ struct CameraConfig {
     std::atomic<int> mode_count{0};
     std::atomic<int> total_count{0};
 
+    // 物品滞留检测（纯 CV 背景差分，不识别物品类别；与计数逻辑完全解耦）。
+    // 见 include/item_abandonment.h / src/item_abandonment.cpp。
+    std::unique_ptr<ItemAbandonmentDetector> item_detector;
+    std::atomic<int> item_alarm{0};   // 处于告警态(L1+L2)的滞留物数
+    std::atomic<int> item_l1{0};
+    std::atomic<int> item_l2{0};
+
     std::shared_ptr<cv::Mat> display_frame_ptr;
     std::mutex display_ptr_mutex;
     int display_w = 640, display_h = 360;
@@ -145,7 +153,13 @@ struct CameraConfig {
           in_count(o.in_count.load()), out_count(o.out_count.load()),
           retro_count(o.retro_count.load()),
           recent_counts(std::move(o.recent_counts)), filtered_count(o.filtered_count),
-          zone_count(o.zone_count.load())
+          zone_count(o.zone_count.load()),
+          mode_count(o.mode_count.load()),
+          total_count(o.total_count.load()),
+          item_detector(std::move(o.item_detector)),
+          item_alarm(o.item_alarm.load()),
+          item_l1(o.item_l1.load()),
+          item_l2(o.item_l2.load())
     { o.send_db = nullptr; o.g_nPort = -1; }
     
     ~CameraConfig() {
@@ -320,6 +334,11 @@ void processCamera(CameraConfig& cfg) {
     }
     cfg.tracker = std::make_unique<ByteTrackTracker>(0.18f, 0.35f, 0.25f, 180, 2);
 
+    // 物品滞留检测器（纯 CV 双背景差分，不用 NPU）。参数来自 abandon_config.txt，
+    // 支持 roleN. 前缀按角色覆盖；文件不存在则用内置默认值。
+    cfg.item_detector = std::make_unique<ItemAbandonmentDetector>(
+        loadAbandonConfig("abandon_config.txt", cfg.role), cfg.unique_id);
+
     // 海康登录
     NET_DVR_USER_LOGIN_INFO li = {0}; NET_DVR_DEVICEINFO_V40 di = {0};
     strncpy(li.sDeviceAddress, cfg.ip.c_str(), sizeof(li.sDeviceAddress)-1);
@@ -454,6 +473,30 @@ void processCamera(CameraConfig& cfg) {
         std::map<int, GateIdMark> id_marks;
         for (const auto& m : gate_counter.marks()) id_marks[m.track_id] = m;
         const int ids_inside = gate_counter.insideCount();
+
+        // ==================== 物品滞留检测（纯CV背景差分，与计数解耦）====================
+        // ⚠️ 必须在 draw(raw,...) 之前调用：raw 一旦被画上框/掩膜，就会污染背景差分。
+        // 二级告警(PUSH) = "物品滞留认定"，对应硬指标默认 60s，见 AbandonConfig::push_sec。
+        std::vector<ItemEvent> item_events;
+        if (cfg.item_detector) {
+            item_events = cfg.item_detector->update(raw, tracks, cfg.detection_mask,
+                                                    capture_ms, rid);
+            for (const auto& e : item_events) {
+                std::cerr << "[ITEM] ts=" << e.ts_ms << " " << cfg.unique_id
+                          << " item=" << e.item_id
+                          << " event=" << itemEventName(e.type)
+                          << " static=" << (int)(e.static_sec + 0.5) << "s"
+                          << " owner=" << e.owner_id
+                          << " box=(" << e.box.x << "," << e.box.y << ","
+                          << e.box.width << "," << e.box.height << ")"
+                          << (e.note.empty() ? "" : (" note=" + e.note))
+                          << (e.evidence_dir.empty() ? "" : (" evidence=" + e.evidence_dir))
+                          << "\n";
+            }
+            cfg.item_alarm = cfg.item_detector->alarmCount();
+            cfg.item_l1 = cfg.item_detector->level1Count();
+            cfg.item_l2 = cfg.item_detector->level2Count();
+        }
         if (g_enable_zone_trace && !gate_events.empty()) {
             for (const auto& kv : id_marks) {
                 const GateIdMark& m = kv.second;
@@ -556,10 +599,54 @@ void processCamera(CameraConfig& cfg) {
                             0.45, foot_col, 1);
             }
         }
-        // 第一行：黄色，基础信息
+        // 滞留物框 + 主人连线：红=L2推送, 黄=L1提醒, 橙=静止候选, 灰=移动中。
+        // ⚠️ OpenCV 的 putText 只支持 ASCII —— 标签一律用英文短词，中文会画成 "???"。
+        if (cfg.item_detector) {
+            const float sx = (float)cfg.display_w / raw.cols;
+            const float sy = (float)cfg.display_h / raw.rows;
+            for (const auto& it : cfg.item_detector->items()) {
+                if (it.missing_frames > 0) continue;   // 本帧未观测（遮挡/已消失）不画
+                cv::Scalar col;
+                std::string tag;
+                const int sec = it.unattended_since_ms > 0
+                    ? (int)((capture_ms - it.unattended_since_ms) / 1000) : 0;
+                switch (it.state) {
+                    case ItemState::LEVEL2_PUSH:
+                        col = cv::Scalar(0,0,255);     tag = "L2 PUSH " + std::to_string(sec) + "s"; break;
+                    case ItemState::LEVEL1_REMIND:
+                        col = cv::Scalar(0,215,255);   tag = "L1 REMIND " + std::to_string(sec) + "s"; break;
+                    case ItemState::STATIC_CANDIDATE:
+                        col = cv::Scalar(0,165,255);   tag = "STATIC " + std::to_string(sec) + "s"; break;
+                    default:
+                        col = cv::Scalar(160,160,160); tag = "MOVING"; break;
+                }
+                const cv::Rect rb((int)(it.box.x*sx), (int)(it.box.y*sy),
+                                  (int)(it.box.width*sx), (int)(it.box.height*sy));
+                cv::rectangle(dp, rb, col, 2);
+                const int ty = (rb.y - 6 < 12) ? (rb.y + 16) : (rb.y - 6);
+                cv::putText(dp, tag, cv::Point(rb.x, ty), cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 2);
+                // 主人连线（黄线：人框中心 → 物品质心），一眼看出"这是谁的东西"
+                if (it.owner_id >= 0 && !it.owner_left) {
+                    for (const auto& t : tracks) {
+                        if (t.track_id != it.owner_id) continue;
+                        cv::line(dp,
+                                 cv::Point((int)((t.box.x + t.box.width*0.5f)*sx),
+                                           (int)((t.box.y + t.box.height*0.5f)*sy)),
+                                 cv::Point((int)(it.centroid.x*sx), (int)(it.centroid.y*sy)),
+                                 cv::Scalar(0,255,255), 1, cv::LINE_AA);
+                        break;
+                    }
+                }
+            }
+        }
+        // 第一行：黄色，基础信息（含滞留告警数 ITEM）
+        std::string item_tag = " ITEM:" + std::to_string(cfg.item_alarm.load());
+        if (cfg.item_l2.load() > 0) item_tag += "(L2:" + std::to_string(cfg.item_l2.load()) + ")";
+        else if (cfg.item_l1.load() > 0) item_tag += "(L1:" + std::to_string(cfg.item_l1.load()) + ")";
         std::string info1 = cfg.unique_id + " Zone:" + std::to_string(zn)
                           + " Tot:" + std::to_string((int)tracks.size())
-                          + " IDsIn:" + std::to_string(ids_inside);
+                          + " IDsIn:" + std::to_string(ids_inside)
+                          + item_tag;
         cv::putText(dp, info1, cv::Point(5, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,255,255), 1);
         // 第二行：红色大字，只显示本相机角色的计数（入口=IN/RETRO，出口=OUT/RETRO）
         std::string info2 = gateCountSummary(cfg);
@@ -581,6 +668,8 @@ void processCamera(CameraConfig& cfg) {
             std::cout << cfg.unique_id << " FPS:" << cfg.fps << " Zone:" << zn
                      << " Tot:" << tracks.size()
                      << " IDsIn:" << ids_inside
+                     << " ITEM:" << cfg.item_alarm.load()
+                     << "(L1:" << cfg.item_l1.load() << " L2:" << cfg.item_l2.load() << ")"
                      << " " << gateCountSummary(cfg)
                      << std::endl;
             std::cout << "[PERF] " << cfg.unique_id
@@ -685,18 +774,19 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (ok) {
-                    int max_zone = 0, total_in = 0, total_out = 0, total_retro = 0;
+                    int max_zone = 0, total_in = 0, total_out = 0, total_retro = 0, total_item = 0;
                     for (auto& c : cameras) {
                         max_zone = std::max(max_zone, c.zone_count.load());
                         total_in += c.in_count.load();
                         total_out += c.out_count.load();
                         total_retro += c.retro_count.load();
+                        total_item += c.item_alarm.load();
                     }
                     char mx[64]; snprintf(mx, 64, "Max Zone: %d", max_zone);
                     cv::putText(comb, mx, cv::Point(5, 60),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,0,255), 1);
-                    char fused[64]; snprintf(fused, 64, "Total IN:%d OUT:%d RETRO:%d",
-                                             total_in, total_out, total_retro);
+                    char fused[96]; snprintf(fused, 96, "Total IN:%d OUT:%d RETRO:%d ITEM:%d",
+                                             total_in, total_out, total_retro, total_item);
                     cv::putText(comb, fused, cv::Point(5, 80),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,0,255), 1);
                     cv::imshow(wn, comb);
@@ -709,11 +799,12 @@ int main(int argc, char** argv) {
     }
     for (auto& t : ths) if (t.joinable()) t.join();
     NET_DVR_Cleanup();
-    int total_in = 0, total_out = 0, total_retro = 0;
-    for (auto& c : cameras) { total_in += c.in_count.load(); total_out += c.out_count.load(); total_retro += c.retro_count.load(); }
+    int total_in = 0, total_out = 0, total_retro = 0, total_item = 0;
+    for (auto& c : cameras) { total_in += c.in_count.load(); total_out += c.out_count.load(); total_retro += c.retro_count.load(); total_item += c.item_alarm.load(); }
     std::cout << "Total Final IN:" << total_in
               << " OUT:" << total_out
-              << " RETRO:" << total_retro << std::endl;
+              << " RETRO:" << total_retro
+              << " ITEM:" << total_item << std::endl;
     std::cout << "V4 stopped." << std::endl;
     return 0;
 }

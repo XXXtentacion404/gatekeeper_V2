@@ -32,10 +32,22 @@ build-check/hosttest/tracker_noreid.cpp
 # ==================== 大体积资源：视频 / 图片素材 ====================
 vidoes/
 weights/
-vidoes/
 文档/
-build-check/
 __pycache__/
+
+# build-check 整体忽略，但必须放行回归测试源码与脚本（仓库历史曾丢失过一次）。
+# ⚠️ gitignore 是"最后匹配者优先"，所以放行规则必须写在忽略规则之后；
+#    只写一条 build-check/ 会把下面的 test_*.cpp 一起吞掉（曾导致测试源码全部没入库）。
+build-check/*
+!build-check/hosttest/
+build-check/hosttest/*
+!build-check/hosttest/stub/
+!build-check/hosttest/stub/**
+!build-check/hosttest/*.cpp
+!build-check/hosttest/*.py
+!build-check/hosttest/*.ps1
+# 由脚本从 src/tracker.cpp 自动生成的对照版，属派生产物（放行 .cpp 后再单独忽略）
+build-check/hosttest/tracker_noreid.cpp
 # ==================== 权重与模型 ====================
 # 忽略模型、训练产物；但保留目录下的小脚本（如 onnx_to_rknn.py 转换脚本）
 weights/*
