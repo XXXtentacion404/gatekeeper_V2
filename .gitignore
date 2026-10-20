@@ -53,6 +53,10 @@ build-check/hosttest/*
 !build-check/hosttest/*.ps1
 # 由脚本从 src/tracker.cpp 自动生成的对照版，属派生产物（放行 .cpp 后再单独忽略）
 build-check/hosttest/tracker_noreid.cpp
+# build-check 根目录下的运维/标定脚本体积小、不可再生（上板推送、抓背景图、标定），
+# 必须入库；上面的 build-check/* 会一起吞掉，所以这里再放行一次（* 不跨越 /）。
+!build-check/*.py
+!build-check/*.ps1
 # ==================== 权重与模型 ====================
 # 忽略模型、训练产物；但保留目录下的小脚本（如 onnx_to_rknn.py 转换脚本）
 weights/*
