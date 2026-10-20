@@ -323,6 +323,23 @@ void draw(cv::Mat& img,
 }
 
 // ==================== 处理线程 ====================
+// 滞留检测配置查找：优先当前目录，其次上一级 —— 兼容「在 build/ 下运行」和
+// 「在项目根运行」两种习惯。09-22 教训：写死相对路径时，从 build/ 启动会
+// 找不到文件 → 静默退回内置默认值（ref_bg_path 为空、mode 退回 mog2），
+// 表现为"新功能好像没生效"。这里显式探测，找不到也由 loadAbandonConfig 打印提示。
+static std::string resolveAbandonConfigPath() {
+    static const char* kCands[] = {
+        "abandon_config.txt",
+        "../abandon_config.txt",
+        "../../abandon_config.txt",
+    };
+    for (const char* p : kCands) {
+        std::ifstream f(p);
+        if (f.is_open()) return p;
+    }
+    return kCands[0];
+}
+
 void processCamera(CameraConfig& cfg) {
     cfg.send_db = getDB("results_v4.db");
     cfg.yolov8_pool = std::make_unique<Yolov8ThreadPool>();
@@ -337,7 +354,7 @@ void processCamera(CameraConfig& cfg) {
     // 物品滞留检测器（纯 CV 双背景差分，不用 NPU）。参数来自 abandon_config.txt，
     // 支持 roleN. 前缀按角色覆盖；文件不存在则用内置默认值。
     cfg.item_detector = std::make_unique<ItemAbandonmentDetector>(
-        loadAbandonConfig("abandon_config.txt", cfg.role), cfg.unique_id);
+        loadAbandonConfig(resolveAbandonConfigPath(), cfg.role), cfg.unique_id);
 
     // 海康登录
     NET_DVR_USER_LOGIN_INFO li = {0}; NET_DVR_DEVICEINFO_V40 di = {0};

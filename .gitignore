@@ -35,6 +35,11 @@ weights/
 文档/
 __pycache__/
 
+# 源码快照目录（src/include 的整目录拷贝）与背景图预览：都是派生产物，
+# git 本身已经是备份，重复入库只会让历史翻倍。
+gatekeeper_V4_src_2026*/
+abandon_bg_*_preview.jpg
+
 # build-check 整体忽略，但必须放行回归测试源码与脚本（仓库历史曾丢失过一次）。
 # ⚠️ gitignore 是"最后匹配者优先"，所以放行规则必须写在忽略规则之后；
 #    只写一条 build-check/ 会把下面的 test_*.cpp 一起吞掉（曾导致测试源码全部没入库）。

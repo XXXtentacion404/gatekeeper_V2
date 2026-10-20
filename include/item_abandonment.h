@@ -209,7 +209,8 @@ public:
     bool setRefBackground(const cv::Mat& full_bgr);
 
     // —— 供显示 / 统计 ——
-    const std::vector<ItemTrack>& items() const { return items_; }    int alarmCount() const;                 // 处于告警态(L1/L2)的滞留物数
+    const std::vector<ItemTrack>& items() const { return items_; }
+    int alarmCount() const;                 // 处于告警态(L1/L2)的滞留物数
     int level1Count() const;                // L1 数量
     int level2Count() const;                // L2 数量
     bool warmupDone() const { return frame_count_ >= cfg_.warmup_frames; }
