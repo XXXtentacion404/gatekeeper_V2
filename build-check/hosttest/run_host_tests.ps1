@@ -92,6 +92,10 @@ if ($py) {
 Invoke-Suite 'ByteTrack occlusion re-association' `
   'test_tracker_reid.cpp' @('src\tracker.cpp')
 
+# ---- 2b. clear-scene dual-temporal session (item abandonment core) ----
+Invoke-Suite 'ClearScene dual-temporal session (abandonment core)' `
+  'test_change_session.cpp' @('src\change_session.cpp')
+
 # ---- 3. control run: re-association disabled (must fail) ----
 Write-Host "`n########## control: occlusion re-association disabled ##########"
 $patched = Join-Path $here 'tracker_noreid.cpp'

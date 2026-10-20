@@ -94,7 +94,7 @@ add_library(draw_lib SHARED src/cv_draw.cpp)
 target_link_libraries(draw_lib ${OpenCV_LIBS})
 
 # === 可执行文件 ===
-add_executable(main_tracking src/main_tracking.cpp src/yolov8_thread_pool.cpp src/mask_utils.cpp src/gate_id_counter.cpp src/comm.cpp src/item_abandonment.cpp)
+add_executable(main_tracking src/main_tracking.cpp src/yolov8_thread_pool.cpp src/mask_utils.cpp src/gate_id_counter.cpp src/comm.cpp src/item_abandonment.cpp src/change_session.cpp)
 target_link_libraries(main_tracking draw_lib yolov8_lib bytetrack_lib ${HIK_LIBS} ${OpenCV_LIBS} pthread dl ${SQLite3_LIBRARIES})
 install(TARGETS main_tracking DESTINATION bin)
 
